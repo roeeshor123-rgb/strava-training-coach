@@ -44,8 +44,12 @@ Grade: X/10 - one-line verdict
 RECOVERY CONTEXT (Garmin, before the run) - only if Garmin data was available
 COACH'S PLAN - only if a scheduled workout existed for this date, prescribed vs actual
 SUMMARY - 2-3 sentences on what the session was and the headline finding
+WORKOUT BREAKDOWN - REQUIRED whenever laps or km_splits data is present in the JSON. This is the most important section - do not skip it or reduce it to an average. Use the actual per-lap/per-km numbers, not just overall averages:
+  - For a structured session (name/description suggests פארטלק/fartlek, אינטרוולים/intervals, or אימון עליות/hill repeats): identify which laps/splits are the work efforts vs the recovery/float segments by their pace+HR pattern (faster pace + higher HR = work; slower + lower = recovery). List EACH work rep with its own pace and HR (e.g. "Rep 1: 4:12/km @ 162bpm, Rep 2: 4:05/km @ 168bpm, Rep 3: 4:15/km @ 171bpm..."), then note the pattern - consistent, fading, or building - and call out the best_efforts data (fastest 400m/1k/etc within the run) if it adds a concrete peak-effort number.
+  - For a volume/long run (ריצת נפח) or race: show the per-km pace+HR progression (negative split / positive split / steady) using km_splits, calling out where it sped up, slowed down, or drifted.
+  - For an easy/recovery run (ריצת שחרור/התאוששות): use km_splits to confirm HR stayed controlled and consistent throughout (or flag late-run HR creep) - the point here is steadiness, not speed.
 SAME-SEGMENT TREND - only if a genuine repeated-segment comparison exists, prior vs today
-GOOD PARTS - 2-3 specific numeric bullets
+GOOD PARTS - 2-3 specific numeric bullets, pulling from the per-lap/per-km breakdown above where possible, not just session-wide averages
 WATCH FOR - 1-3 specific bullets
 OVERTRAINING CHECK: Low/Moderate/High - blend ACWR + Garmin signals + rest-day pattern + HR drift + plan-compliance into ONE verdict with concrete numbers plus one actionable recommendation
 FITNESS CONTEXT - only occasionally (weekly, or when VO2max/predictions changed) - VO2max, race predictions
@@ -123,6 +127,56 @@ def strava_get_activity(activity_id):
 
 def strava_get_gear(gear_id):
     return strava_get(f"gear/{gear_id}")
+
+
+def _mps_to_pace_per_km(speed_mps):
+    if not speed_mps:
+        return None
+    sec_per_km = 1000 / speed_mps
+    return f"{int(sec_per_km // 60)}:{int(sec_per_km % 60):02d}/km"
+
+
+def summarize_activity_detail(detail):
+    """Compact, LLM-friendly extraction of the per-lap/per-km structure from a
+    Strava DetailedActivity - the raw laps/splits_metric/segment_efforts objects
+    are full of nested map/segment metadata that just adds noise and buries the
+    numbers that actually matter for a rep-by-rep or per-km breakdown."""
+    out = {
+        "name": detail.get("name"),
+        "sport_type": detail.get("sport_type"),
+        "distance_km": round((detail.get("distance") or 0) / 1000, 2),
+        "moving_time_s": detail.get("moving_time"),
+        "elapsed_time_s": detail.get("elapsed_time"),
+        "average_heartrate": detail.get("average_heartrate"),
+        "max_heartrate": detail.get("max_heartrate"),
+        "average_pace": _mps_to_pace_per_km(detail.get("average_speed")),
+        "total_elevation_gain_m": detail.get("total_elevation_gain"),
+        "suffer_score": detail.get("suffer_score"),
+        "description": detail.get("description"),
+    }
+    laps = detail.get("laps") or []
+    if laps:
+        out["laps"] = [{
+            "lap": i + 1,
+            "distance_m": round(lp.get("distance", 0)),
+            "time_s": lp.get("moving_time"),
+            "pace": _mps_to_pace_per_km(lp.get("average_speed")),
+            "avg_hr": lp.get("average_heartrate"),
+            "max_hr": lp.get("max_heartrate"),
+        } for i, lp in enumerate(laps)]
+    splits = detail.get("splits_metric") or []
+    if splits:
+        out["km_splits"] = [{
+            "km": sp.get("split"),
+            "time_s": sp.get("moving_time"),
+            "pace": _mps_to_pace_per_km(sp.get("average_speed")),
+            "avg_hr": sp.get("average_heartrate"),
+            "elevation_diff_m": sp.get("elevation_difference"),
+        } for sp in splits]
+    best_efforts = detail.get("best_efforts") or []
+    if best_efforts:
+        out["best_efforts"] = [{"name": be.get("name"), "time_s": be.get("elapsed_time")} for be in best_efforts]
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -262,7 +316,8 @@ def tg_get_updates(offset):
 def llm_compose(task_instructions, data):
     body = {
         "model": "claude-sonnet-5",
-        "max_tokens": 2000,
+        "max_tokens": 4096,
+        "thinking": {"type": "disabled"},
         "system": STYLE_GUIDE,
         "messages": [{
             "role": "user",
@@ -280,7 +335,11 @@ def llm_compose(task_instructions, data):
         timeout=120,
     )
     r.raise_for_status()
-    return "".join(b["text"] for b in r.json()["content"] if b["type"] == "text").strip()
+    resp = r.json()
+    text = "".join(b["text"] for b in resp["content"] if b["type"] == "text").strip()
+    if not text:
+        raise RuntimeError(f"LLM returned empty text (stop_reason={resp.get('stop_reason')}); refusing to send an empty message")
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -389,7 +448,7 @@ def step1_morning_brief(state, now):
     title = workout.get("title", "")
     keyword = next((k for k in ["פארטלק", "אינטרוולים", "אימון עליות", "ריצת נפח", "שחרור"] if k in title), None)
     similar = [a for a in recent if keyword and keyword in a.get("name", "")][:3]
-    similar_detail = [strava_get_activity(a["id"]) for a in similar]
+    similar_detail = [summarize_activity_detail(strava_get_activity(a["id"])) for a in similar]
 
     data = {
         "workout_title": title,
@@ -425,11 +484,28 @@ def step2_telegram_qa(state, now):
             state["last_telegram_update_id"] = u["update_id"]
             continue
         recent = strava_list_activities(after_epoch=int((now - timedelta(days=21)).timestamp()), per_page=30)
-        data = {"question": text, "today": now.date().isoformat(), "recent_activities": recent}
+        # give the LLM full lap/split detail for recent runs (last 14 days, capped) so it can
+        # actually answer pace/HR-per-segment questions, not just session-wide averages
+        run_candidates = [a for a in recent if a.get("sport_type") == "Run"
+                           and (now.date() - datetime.fromisoformat(a["start_date_local"].replace("Z", "")).date()).days <= 14][:15]
+        detailed_runs = []
+        for a in run_candidates:
+            try:
+                detailed_runs.append(summarize_activity_detail(strava_get_activity(a["id"])))
+            except Exception:
+                traceback.print_exc()
+        data = {
+            "question": text,
+            "today": now.date().isoformat(),
+            "recent_activities_summary": recent,
+            "recent_runs_with_lap_and_split_detail": detailed_runs,
+        }
         reply = llm_compose(
             "Answer this Telegram message from Roee. If it references a specific past workout/day, "
-            "identify the matching activity from recent_activities (by weekday/relative date/sport/keywords) "
-            "and answer using its data. If generic (hi/thanks), reply briefly and warmly with no analysis. "
+            "identify the matching activity from recent_activities_summary (by weekday/relative date/sport/keywords), "
+            "then use the matching entry in recent_runs_with_lap_and_split_detail (matched by name/date) for a real "
+            "rep-by-rep or per-km answer if the question is about pace/HR/structure - not just session averages. "
+            "If generic (hi/thanks), reply briefly and warmly with no analysis. "
             "If you can't confidently identify the activity, ask one short clarifying question.",
             data,
         )
@@ -488,7 +564,7 @@ def step3_new_activity_push(state, now):
 
         data = {
             "activity": a,
-            "activity_detail": detail,
+            "activity_detail": summarize_activity_detail(detail),
             "acwr_context": acwr,
             "benchmark_segment_comparison": benchmark,
             "shoe_info": shoe_info,
