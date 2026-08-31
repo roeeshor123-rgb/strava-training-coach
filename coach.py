@@ -189,22 +189,60 @@ def garmin_scheduled_workout_for_date(iso_date):
 # Telegram
 # ---------------------------------------------------------------------------
 
+def _check_telegram_response(r):
+    """Telegram returns HTTP 200 with {"ok": false, ...} on many failures (bad chat_id,
+    message too long, malformed text), so raise_for_status() alone is not enough."""
+    ok = False
+    try:
+        ok = r.json().get("ok", False)
+    except Exception:
+        pass
+    if not r.ok or not ok:
+        raise RuntimeError(f"Telegram send failed: HTTP {r.status_code} body={r.text[:500]}")
+
+
+TELEGRAM_MAX_LEN = 4096
+
+
+def _chunk_text(text, limit=TELEGRAM_MAX_LEN - 100):
+    """Split on paragraph/line boundaries so a long composed message (e.g. weekly
+    summary) sends as multiple messages instead of failing Telegram's 4096-char cap."""
+    if len(text) <= limit:
+        return [text]
+    chunks = []
+    remaining = text
+    while len(remaining) > limit:
+        split_at = remaining.rfind("\n\n", 0, limit)
+        if split_at == -1:
+            split_at = remaining.rfind("\n", 0, limit)
+        if split_at == -1:
+            split_at = limit
+        chunks.append(remaining[:split_at].rstrip())
+        remaining = remaining[split_at:].lstrip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
 def tg_send_message(text):
-    requests.post(
-        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-        data={"chat_id": TELEGRAM_CHAT_ID, "text": text},
-        timeout=30,
-    )
+    for chunk in _chunk_text(text):
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": chunk},
+            timeout=30,
+        )
+        _check_telegram_response(r)
 
 
 def tg_send_photo(path):
     with open(path, "rb") as f:
-        requests.post(
+        r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
             data={"chat_id": TELEGRAM_CHAT_ID},
             files={"photo": f},
             timeout=60,
         )
+    _check_telegram_response(r)
 
 
 def tg_get_updates(offset):
@@ -309,18 +347,22 @@ def find_benchmark_comparison(activity_detail, sport_type, before_epoch):
 
 
 def shoe_mileage_check(activity, state):
+    """Read-only: does NOT mutate state. Caller commits alert keys to
+    state['shoe_alerts_sent'] only after the message carrying them is confirmed sent,
+    so a failed send doesn't silently swallow the alert on retry."""
     gear_id = activity.get("gear_id")
     if not gear_id:
-        return None, None
+        return None, [], []
     gear = strava_get_gear(gear_id)
     km = round(gear["distance"] / 1000, 1)
     alerts = []
+    new_keys = []
     for threshold in (500, 700):
         key = f"{gear_id}_{threshold}"
         if km >= threshold and key not in state["shoe_alerts_sent"]:
             alerts.append({"threshold": threshold, "brand": gear.get("brand_name"), "model": gear.get("model_name"), "km": km})
-            state["shoe_alerts_sent"].append(key)
-    return {"brand": gear.get("brand_name"), "model": gear.get("model_name"), "km": km}, alerts
+            new_keys.append(key)
+    return {"brand": gear.get("brand_name"), "model": gear.get("model_name"), "km": km}, alerts, new_keys
 
 
 # ---------------------------------------------------------------------------
@@ -373,14 +415,14 @@ def step1_morning_brief(state, now):
 
 def step2_telegram_qa(state, now):
     updates = tg_get_updates(state["last_telegram_update_id"] + 1)
-    max_id = state["last_telegram_update_id"]
     for u in updates:
-        max_id = max(max_id, u["update_id"])
         msg = u.get("message")
         if not msg or str(msg.get("chat", {}).get("id")) != str(TELEGRAM_CHAT_ID):
+            state["last_telegram_update_id"] = u["update_id"]
             continue
         text = msg.get("text", "")
         if not text:
+            state["last_telegram_update_id"] = u["update_id"]
             continue
         recent = strava_list_activities(after_epoch=int((now - timedelta(days=21)).timestamp()), per_page=30)
         data = {"question": text, "today": now.date().isoformat(), "recent_activities": recent}
@@ -392,7 +434,9 @@ def step2_telegram_qa(state, now):
             data,
         )
         tg_send_message(reply)
-    state["last_telegram_update_id"] = max_id
+        # only advance past this update once the reply is confirmed sent, so a failure
+        # mid-batch retries just the unsent messages, not the whole batch
+        state["last_telegram_update_id"] = u["update_id"]
 
 
 # ---------------------------------------------------------------------------
@@ -403,16 +447,14 @@ def step3_new_activity_push(state, now):
     recent = strava_list_activities(after_epoch=int((now - timedelta(days=3)).timestamp()), per_page=10)
     recent.sort(key=lambda a: a["start_date_local"])
     last_id = state.get("last_activity_id")
-    new_acts = recent if last_id is None else [a for a in recent if str(a["id"]) > str(last_id)]
-    if last_id:
-        new_acts = [a for a in recent if int(a["id"]) > int(last_id)]
+    new_acts = recent if last_id is None else [a for a in recent if int(a["id"]) > int(last_id)]
 
     for a in new_acts:
         detail = strava_get_activity(a["id"])
         acwr = acwr_context(now)
         before_epoch = int(datetime.fromisoformat(a["start_date_local"].replace("Z", "")).replace(tzinfo=TZ).timestamp())
         benchmark = find_benchmark_comparison(detail, a.get("sport_type"), before_epoch)
-        shoe_info, shoe_alerts = shoe_mileage_check(a, state)
+        shoe_info, shoe_alerts, new_shoe_alert_keys = shoe_mileage_check(a, state)
 
         activity_date = a["start_date_local"][:10]
         workout = garmin_scheduled_workout_for_date(activity_date)
@@ -468,6 +510,8 @@ def step3_new_activity_push(state, now):
             data,
         )
         tg_send_message(text)
+        # only commit these once the send is confirmed successful (see shoe_mileage_check docstring)
+        state["shoe_alerts_sent"].extend(new_shoe_alert_keys)
         state["last_activity_id"] = str(a["id"])
 
 
