@@ -61,7 +61,7 @@ SAME-SEGMENT TREND - only if a genuine repeated-segment comparison exists, prior
 GOOD PARTS - 2-3 specific numeric bullets, pulling from the per-lap/per-km breakdown above where possible, not just session-wide averages
 WATCH FOR - 1-3 specific bullets
 OVERTRAINING CHECK: Low/Moderate/High - blend the Strava-computed acwr_context, athletedata's own load signals (acwr/monotony/ramp_rate/load_flag from athletedata_load_context, remembering load_flag is an anomaly index, not a diagnosis) and TSB/form (from athletedata_load_context's pmc_status, stating which TSB convention you're quoting) + rest-day pattern + HR drift + plan-compliance into ONE verdict with concrete numbers plus one actionable recommendation - don't just list the three sources side by side, actually reconcile them into a single call
-FITNESS CONTEXT - only occasionally (weekly, or when VO2max/predictions changed) - VO2max and lactate threshold (Garmin's own numbers, via garmin_get_user_metrics - not a third-party re-derivation), race predictions (race_predictions, Riegel's formula off Roee's own best real Strava effort - state which effort and date it's extrapolated from, since it's one data point, not a blended model)
+FITNESS CONTEXT - only occasionally (weekly, or when VO2max/predictions changed) - VO2max and lactate threshold (Garmin's own numbers, via garmin_get_user_metrics), race predictions (race_predictions - Garmin Connect's own race predictor, as reported by Roee, NOT computed by you or derived from his training data - say "your Garmin watch predicts" or similar, never present it as this script's estimate, and note the as_of date since it's a manually-updated snapshot)
 
 For the 5am morning brief: render the prescribed session as warmup / main set (with concrete goal paces per segment - convert pace-zone targets to min/km directly, and for HR-zone or effort-based segments like fartlek surges, use the provided historical-pace-lookup data to state a concrete pace range) / cooldown, then a readiness-based go/adjust call, ending with one "TODAY'S GOAL" headline line naming the single most important numeric target for the session.
 
@@ -507,72 +507,24 @@ def acwr_context(now):
             "zero_full_rest_day_in_14d": no_rest_day}
 
 
-# Standard race/best-effort distances, mapped to meters. Keys after the lookup
-# normalization below (lowercase, spaces/hyphens -> "_") match the exact names
-# Strava's DetailedActivity.best_efforts uses ("10 mile" -> "10_mile",
-# "Half-Marathon" -> "half_marathon", etc). Only 3k+ efforts are used as a Riegel
-# reference in strava_race_predictions() - Riegel extrapolates badly from a short
-# sprint effort out to marathon distance; "3k" itself is never a real Strava
-# best_efforts name (their fixed set jumps 2 mile -> 5k) but stays as a valid
-# *target* distance to predict for.
-STANDARD_DISTANCES_M = {
-    "3k": 3000, "5k": 5000, "10k": 10000, "15k": 15000, "10_mile": 16090.3,
-    "20k": 20000, "half_marathon": 21097.5, "30k": 30000, "marathon": 42195,
+# Garmin Connect's own race predictor (its real algorithm - VO2max/training-history
+# based, computed on-device/in the Garmin cloud). Not available through athletedata's
+# API, and the only other way to reach it is the deprecated unofficial garminconnect
+# library this repo intentionally dropped - so this is entered by hand from what
+# Garmin Connect shows, and updated whenever Roee reports a new reading. Deliberately
+# NOT derived from Strava best_efforts or any Riegel/third-party recomputation -
+# Roee asked for Garmin's actual number specifically, not an estimate off his raw
+# training data.
+GARMIN_RACE_PREDICTIONS = {
+    "as_of": "2026-09-02",
+    "source": "Garmin Connect's own race predictor, reported by Roee - not computed by this script",
+    "predicted_times_s": {
+        "5k": 19 * 60 + 56,
+        "10k": 42 * 60 + 9,
+        "half_marathon": 1 * 3600 + 33 * 60 + 22,
+        "marathon": 3 * 3600 + 25 * 60 + 2,
+    },
 }
-
-
-def riegel_predict(reference_time_s, reference_distance_m, target_distance_m, exponent=1.06):
-    return reference_time_s * (target_distance_m / reference_distance_m) ** exponent
-
-
-def strava_race_predictions(now, lookback_days=120, max_runs_scanned=25):
-    """Race-time predictions from Roee's own real Strava data only - Riegel's
-    formula off his single best recent effort at 3k+, not a third-party model.
-    (athletedata's get_performance_estimates was tried first, but that's
-    athletedata's own cross-source algorithm, not a Garmin/Strava passthrough -
-    dropped in favor of this after the numbers didn't hold up.) Garmin's own
-    VO2max/lactate-threshold estimate (garmin_get_user_metrics, genuinely
-    Garmin-computed) is fetched separately as a cross-check, not blended in here."""
-    after_epoch = int((now - timedelta(days=lookback_days)).timestamp())
-    acts = []
-    page = 1
-    while True:
-        batch = strava_list_activities(after_epoch=after_epoch, per_page=100, page=page)
-        if not batch:
-            break
-        acts.extend(batch)
-        if len(batch) < 100:
-            break
-        page += 1
-    runs = [a for a in acts if a.get("sport_type") == "Run"][:max_runs_scanned]
-
-    best = None  # (equivalent_10k_time_s, name, distance_m, time_s, date)
-    for a in runs:
-        try:
-            detail = strava_get_activity(a["id"])
-        except Exception:
-            continue
-        for be in detail.get("best_efforts") or []:
-            key = (be.get("name") or "").lower().replace(" ", "_").replace("-", "_")
-            dist_m = STANDARD_DISTANCES_M.get(key)
-            t = be.get("elapsed_time")
-            if not dist_m or dist_m < 3000 or not t:
-                continue
-            equiv_10k = riegel_predict(t, dist_m, 10000)
-            if best is None or equiv_10k < best[0]:
-                best = (equiv_10k, be.get("name"), dist_m, t, a["start_date_local"][:10])
-
-    if not best:
-        return None
-    _, name, dist_m, t, when = best
-    return {
-        "reference_effort": name,
-        "reference_distance_m": dist_m,
-        "reference_time_s": t,
-        "reference_date": when,
-        "method": "Riegel's formula (exponent 1.06), extrapolated from this single best real Strava effort - not a blended or third-party model",
-        "predicted_times_s": {label: round(riegel_predict(t, dist_m, d)) for label, d in STANDARD_DISTANCES_M.items()},
-    }
 
 
 def find_benchmark_comparison(activity_detail, sport_type, before_epoch):
@@ -732,10 +684,9 @@ def step3_new_activity_push(state, now):
         daily_row = daily_metrics_row_for_date(activity_date)
         stress = athletedata_safe("garmin_get_stress", {"start_date": activity_date, "end_date": activity_date})
         load_context = athletedata_load_context()
-        # race predictions are deliberately NOT fetched per-activity - the style guide
-        # already scopes FITNESS CONTEXT to "occasionally", and computing them means
-        # scanning ~25 runs' worth of Strava detail (see strava_race_predictions),
-        # which belongs in the weekly summary, not every single new-activity push
+        # race predictions are only surfaced in the weekly summary (see
+        # GARMIN_RACE_PREDICTIONS) - the style guide already scopes FITNESS CONTEXT
+        # to "occasionally", not every single new-activity push
 
         # easy-run HR drift baseline
         hr_drift = None
@@ -896,11 +847,11 @@ def step4_weekly_summary(state, now):
             next_week_workouts.append({"date": d, "title": w.get("title")})
 
     load_context = athletedata_load_context()
-    # race predictions: Strava-only (Riegel off Roee's own best real effort), plus
-    # Garmin's own VO2max/threshold as a separate cross-check - NOT athletedata's
-    # get_performance_estimates, which is athletedata's own cross-source algorithm
-    # rather than a Garmin/Strava passthrough and didn't hold up against real numbers
-    race_predictions = strava_race_predictions(now)
+    # race predictions: Garmin Connect's own race predictor, reported by Roee - not
+    # athletedata's get_performance_estimates (its own cross-source algorithm, not a
+    # Garmin passthrough) and not a Riegel recomputation off Strava data - Roee asked
+    # for Garmin's actual number specifically, see GARMIN_RACE_PREDICTIONS above
+    race_predictions = GARMIN_RACE_PREDICTIONS
     user_metrics = athletedata_safe("garmin_get_user_metrics", {
         "start_date": (now - timedelta(days=90)).date().isoformat(), "end_date": today,
     })
