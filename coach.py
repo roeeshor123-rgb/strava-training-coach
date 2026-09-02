@@ -953,10 +953,39 @@ def step4_weekly_summary(state, now):
 
 
 # ---------------------------------------------------------------------------
+# Test ping - manual liveness/integration check, triggered via workflow_dispatch
+# ---------------------------------------------------------------------------
+
+def send_test_ping():
+    """Sends one Telegram message confirming the bot is reachable, and actually
+    exercises the Strava and athletedata integrations rather than just replying
+    with a static string - so a successful ping is real evidence those secrets
+    and connections work, not just that the process could start."""
+    lines = ["Coach is live and reachable."]
+
+    try:
+        strava_access_token()
+        lines.append("Strava: OK (token refreshed)")
+    except Exception:
+        lines.append("Strava: FAILED to refresh token - check STRAVA_* secrets")
+
+    readiness = athletedata_safe("get_readiness_today")
+    if readiness and readiness.get("readiness_score") is not None:
+        lines.append(f"athletedata: OK (readiness {readiness['readiness_score']}, verdict {readiness.get('verdict')})")
+    else:
+        lines.append("athletedata: no data returned - check ATHLETEDATA_API_KEY")
+
+    tg_send_message("\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main():
+    if os.environ.get("PING_TEST", "").strip().lower() == "true":
+        send_test_ping()
+        return
     now = datetime.now(TZ)
     state = load_state()
     try:
