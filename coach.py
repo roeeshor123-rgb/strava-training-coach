@@ -14,6 +14,7 @@ API is called once per outgoing message to compose the natural-language text
 following the STYLE_GUIDE below, given the computed data as JSON.
 """
 import os
+import re
 import sys
 import json
 import random
@@ -37,9 +38,20 @@ ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 
 STYLE_GUIDE = """You are Roee Shor's automated Strava + athletedata running/strength coach, writing him a Telegram message. Roee trains running (easy runs, volume runs, intervals, hill repeats, fartlek) plus regular weight training, in Tel Aviv. Session names are often in Hebrew (e.g. ריצת נפח = volume run, ריצת שחרור = easy/shakeout run, אינטרוולים = intervals, אימון עליות = hill repeats, פארטלק = fartlek, אימון התאוששות = recovery session) - keep Hebrew names as-is when referencing them.
 
-Write plain text only, no markdown asterisks/headers. Never generic filler - every line must reflect the athlete's actual numbers from the JSON data you're given. Be direct, specific, and numeric.
+FORMAT: the message is sent as Telegram HTML, so use it to make the message easy to scan on a phone, not a dense wall of text:
+- Wrap each section label (SUMMARY, WORKOUT BREAKDOWN, OVERTRAINING CHECK, etc.) and the header line in <b>bold</b> tags. Bold key numbers you want to stand out (a grade, a verdict, a PR).
+- Blank line between every section - never run sections together.
+- Use "• " at the start of a line for bullet points (GOOD PARTS, WATCH FOR, rep-by-rep breakdowns), not "-" or "*".
+- The ONLY tags available are <b>, <i>, <code>, <a href="...">. No headers, no lists, no tables - structure comes from bold + blank lines + bullets, not markup variety.
+- NEVER type a literal < or > character in prose (e.g. write "under 150bpm" not "<150bpm", "over 5:00/km" not ">5:00/km") - a stray angle bracket breaks the whole message's rendering. Avoid a literal & too (write "and").
+- Never use markdown asterisks (**bold**) or underscores for emphasis - this is HTML, not markdown.
+Never generic filler - every line must reflect the athlete's actual numbers from the JSON data you're given. Be direct, specific, and numeric.
 
 If the DATA JSON includes long_term_notes, those are things you already know about Roee from past weeks - not stats to re-derive, but standing context (a recurring tendency, how he responds to a session type, a real constraint). Reference one naturally when it's actually relevant to what you're writing; don't force a callback if none of them apply this time.
+
+If the DATA JSON includes recent_conversation, that's the actual recent chat history with Roee - every message the coach has sent AND every question Roee has asked, oldest first, across ALL message types (morning briefs, per-activity pushes, weekly summaries, his questions and your answers) - not just Q&A. This is real memory of what has actually been discussed: if he asked something an hour ago, or you flagged something in this morning's brief, treat that as already-established context rather than repeating it cold or acting like this message starts from nothing. Use it to avoid redundancy (don't re-explain something just covered) and to pick up threads (a vague follow-up question almost always refers to whatever is most recent in here).
+
+If the DATA JSON includes other_activities_today, Roee trained more than once today - factor the EARLIER session(s) into your read of this one (e.g. a hard interval session this morning changes what an elevated-HR easy walk tonight means; two sessions same day compounds fatigue differently than one) rather than analyzing this activity in isolation.
 
 Recovery, fitness, and plan data comes from athletedata - a cross-source analytics layer over Garmin, TrainingPeaks, and other connected platforms - not from Garmin directly. Its JSON fields routinely carry their own "note" / "disclaimer" / "verdict_note" / "freshness_note" / "_tsb_pairing_note" strings explaining exactly how that number may and may not be described (e.g. don't call a value "your Garmin recovery score" when it's athletedata's own composite; a load-flag index is explicitly "NOT a validated injury predictor" - never call it an injury risk or a diagnosis; TSB has two different conventions (start-of-day vs end-of-day) depending on which tool it came from - say which basis you're quoting if you cite it alongside CTL/ATL). Read and follow those embedded notes when composing instead of paraphrasing past them - they exist specifically to prevent misattribution to the athlete.
 
@@ -50,7 +62,7 @@ For a per-activity analysis message, use this structure (omit any optional secti
 An emoji + activity name/type + date as a header line (running emoji for runs, weights emoji for strength)
 Grade: X/10 - one-line verdict
 
-RECOVERY CONTEXT (athletedata, before the run) - only if recovery data was available
+RECOVERY CONTEXT (athletedata, before the run) - only if recovery data was available. Include VO2max and fitness age when recent_user_metrics has them (a short line is fine, e.g. "VO2max 56, fitness age 20") - this is cheap to fetch now and should show up regularly, not be treated as rare
 COACH'S PLAN - only if a scheduled workout existed for this date, prescribed vs actual
 SUMMARY - 2-3 sentences on what the session was and the headline finding
 WORKOUT BREAKDOWN - REQUIRED whenever laps or km_splits data is present in the JSON. This is the most important section - do not skip it or reduce it to an average. Use the actual per-lap/per-km numbers, not just overall averages:
@@ -61,13 +73,13 @@ SAME-SEGMENT TREND - only if a genuine repeated-segment comparison exists, prior
 GOOD PARTS - 2-3 specific numeric bullets, pulling from the per-lap/per-km breakdown above where possible, not just session-wide averages
 WATCH FOR - 1-3 specific bullets
 OVERTRAINING CHECK: Low/Moderate/High - blend the Strava-computed acwr_context, athletedata's own load signals (acwr/monotony/ramp_rate/load_flag from athletedata_load_context, remembering load_flag is an anomaly index, not a diagnosis) and TSB/form (from athletedata_load_context's pmc_status, stating which TSB convention you're quoting) + rest-day pattern + HR drift + plan-compliance into ONE verdict with concrete numbers plus one actionable recommendation - don't just list the three sources side by side, actually reconcile them into a single call
-FITNESS CONTEXT - only occasionally (weekly, or when VO2max/predictions changed) - VO2max and lactate threshold (Garmin's own numbers, via garmin_get_user_metrics), race predictions (race_predictions - Garmin Connect's own race predictor, as reported by Roee, NOT computed by you or derived from his training data - say "your Garmin watch predicts" or similar, never present it as this script's estimate, and note the as_of date since it's a manually-updated snapshot)
+FITNESS CONTEXT - garmin_race_predictions is now present in every message's DATA, same as VO2max - it's Garmin Connect's own race predictor, as reported by Roee, NOT computed by you or derived from his training data (say "your Garmin watch predicts" or similar, never present it as this script's estimate, and note the as_of date since it's a manually-updated snapshot). Use judgment on when to actually MENTION it in the message text: always fine as a one-line callback after a notably strong effort, a PR, or in the weekly summary; skip it in routine easy-run or strength messages where it adds nothing new - don't paste the same four numbers into every single message regardless of relevance.
 
 For the 5am morning brief: render the prescribed session as warmup / main set (with concrete goal paces per segment - convert pace-zone targets to min/km directly, and for HR-zone or effort-based segments like fartlek surges, use the provided historical-pace-lookup data to state a concrete pace range) / cooldown, then a readiness-based go/adjust call, ending with one "TODAY'S GOAL" headline line naming the single most important numeric target for the session.
 
 For the weekly summary: cover the week's sessions, the 3-month trend read, standout sessions, shoe mileage, VO2max/race predictions, next week's plan preview, and 1-2 concrete suggestions, using the OVERTRAINING VERDICT blend described above.
 
-For a Telegram Q&A reply: answer directly and specifically using the matched activity's data and any recovery context provided. If it's just a generic greeting, reply briefly and warmly with no analysis.
+For a Telegram Q&A reply: answer directly and specifically using the matched activity's data and any recovery context provided. If it's just a generic greeting, reply briefly and warmly with no analysis. If recent_conversation is present, it's the actual back-and-forth history with Roee (oldest first) - treat it as real conversational memory: a follow-up like "and how does that compare to last week" refers to whatever was just discussed, so resolve the reference from recent_conversation instead of re-asking what he means or restarting the topic from scratch.
 
 Output ONLY the message text to send - no preamble, no explanation of what you're doing."""
 
@@ -85,10 +97,20 @@ def load_state():
             "last_morning_checkin_date": None,
             "shoe_alerts_sent": [],
             "coach_notes": [],
+            "message_log": [],
         }
     with open(STATE_PATH, encoding="utf-8") as f:
         state = json.load(f)
-    state.setdefault("coach_notes", [])  # back-compat for state.json written before this existed
+    # back-compat for state.json written before these existed
+    state.setdefault("coach_notes", [])
+    if "telegram_conversation" in state:
+        # superseded by the broader message_log below (2026-09-06) - migrate
+        # the old Q&A-only history in rather than lose it
+        state.setdefault("message_log", [])
+        for entry in state.pop("telegram_conversation"):
+            state["message_log"].append({"at": entry.get("at"), "type": "user_question", "text": entry.get("question", "")})
+            state["message_log"].append({"at": entry.get("at"), "type": "qa_reply", "text": entry.get("answer", "")})
+    state.setdefault("message_log", [])
     return state
 
 
@@ -101,6 +123,25 @@ def long_term_notes(state):
     """The plain list of remembered note strings, newest last, for embedding in a
     compose call's DATA JSON - callers don't need the per-note date wrapper."""
     return [n["note"] for n in state.get("coach_notes", [])]
+
+
+def remember_message(state, now, msg_type, text):
+    """Append one entry to the unified conversation log - every message the bot
+    SENDS across all 4 job types, plus every question Roee asks, not just
+    Telegram Q&A pairs. This is short-term working memory (what has actually
+    been said in the chat recently), distinct from coach_notes (long-term
+    distilled patterns) - both get fed into every compose call so the coach
+    isn't starting cold on each run. Capped at 30 entries (~a week of typical
+    activity) so the DATA JSON stays a reasonable size."""
+    state.setdefault("message_log", [])
+    state["message_log"].append({"at": now.isoformat(), "type": msg_type, "text": text})
+    state["message_log"] = state["message_log"][-30:]
+
+
+def recent_conversation(state, limit=15):
+    """The most recent entries of the unified log, oldest first, for embedding
+    in a compose call's DATA JSON as the actual chat history."""
+    return state.get("message_log", [])[-limit:]
 
 
 def maybe_extract_durable_note(state, context_label, data, message_text):
@@ -405,14 +446,37 @@ def _chunk_text(text, limit=TELEGRAM_MAX_LEN - 100):
     return chunks
 
 
+_HTML_TAG_RE = re.compile(r"</?(?:b|i|code|a)(?:\s[^>]*)?>", re.IGNORECASE)
+
+
+def _strip_allowed_html(text):
+    """Fallback for when the LLM's HTML doesn't parse (unescaped stray < or >,
+    an unclosed tag) - strip just the tags we ever ask for and send plain text
+    rather than fail to deliver the message at all."""
+    return _HTML_TAG_RE.sub("", text)
+
+
 def tg_send_message(text):
     for chunk in _chunk_text(text):
         r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            data={"chat_id": TELEGRAM_CHAT_ID, "text": chunk},
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": chunk, "parse_mode": "HTML"},
             timeout=30,
         )
-        _check_telegram_response(r)
+        try:
+            _check_telegram_response(r)
+        except RuntimeError:
+            # Telegram's HTML parser rejected this chunk (most likely a stray
+            # </>/&: the LLM occasionally slips past the style-guide instruction) -
+            # retry once as plain text so the message still gets delivered.
+            print("Telegram HTML send failed, retrying as plain text:", file=sys.stderr)
+            traceback.print_exc()
+            r2 = requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                data={"chat_id": TELEGRAM_CHAT_ID, "text": _strip_allowed_html(chunk)},
+                timeout=30,
+            )
+            _check_telegram_response(r2)
 
 
 def tg_send_photo(path):
@@ -587,6 +651,9 @@ def step1_morning_brief(state, now):
     readiness = athletedata_safe("get_readiness_today")
     daily_row = daily_metrics_row_for_date(today)
     stress = athletedata_safe("garmin_get_stress", {"start_date": today, "end_date": today})
+    user_metrics = athletedata_safe("garmin_get_user_metrics", {
+        "start_date": (now - timedelta(days=14)).date().isoformat(), "end_date": today,
+    })
 
     # pull recent activities of similar name for pace-lookup context
     recent = strava_list_activities(after_epoch=int((now - timedelta(days=45)).timestamp()), per_page=30)
@@ -601,8 +668,11 @@ def step1_morning_brief(state, now):
         "readiness_today": readiness,
         "daily_metrics_today": daily_row,
         "stress_and_body_battery": stress,
+        "recent_user_metrics": user_metrics,
+        "garmin_race_predictions": GARMIN_RACE_PREDICTIONS,
         "similar_recent_sessions": similar_detail,
         "long_term_notes": long_term_notes(state),
+        "recent_conversation": recent_conversation(state),
     }
     text = llm_compose(
         "Compose the 5am daily training brief per the morning-brief instructions in your system prompt. "
@@ -611,6 +681,7 @@ def step1_morning_brief(state, now):
     )
     tg_send_message(text)
     state["last_morning_checkin_date"] = today
+    remember_message(state, now, "morning_brief", text)
 
 
 # ---------------------------------------------------------------------------
@@ -644,6 +715,8 @@ def step2_telegram_qa(state, now):
             "today": now.date().isoformat(),
             "recent_activities_summary": recent,
             "recent_runs_with_lap_and_split_detail": detailed_runs,
+            "garmin_race_predictions": GARMIN_RACE_PREDICTIONS,
+            "recent_conversation": recent_conversation(state),
             "long_term_notes": long_term_notes(state),
         }
         reply = llm_compose(
@@ -659,6 +732,8 @@ def step2_telegram_qa(state, now):
         # only advance past this update once the reply is confirmed sent, so a failure
         # mid-batch retries just the unsent messages, not the whole batch
         state["last_telegram_update_id"] = u["update_id"]
+        remember_message(state, now, "user_question", text)
+        remember_message(state, now, "qa_reply", reply)
 
 
 # ---------------------------------------------------------------------------
@@ -684,9 +759,18 @@ def step3_new_activity_push(state, now):
         daily_row = daily_metrics_row_for_date(activity_date)
         stress = athletedata_safe("garmin_get_stress", {"start_date": activity_date, "end_date": activity_date})
         load_context = athletedata_load_context()
-        # race predictions are only surfaced in the weekly summary (see
-        # GARMIN_RACE_PREDICTIONS) - the style guide already scopes FITNESS CONTEXT
-        # to "occasionally", not every single new-activity push
+        # VO2max/fitness age: cheap single call, fetched every push now (was
+        # weekly-only before, which was the actual bug - Roee wants to see it
+        # regularly, not buried in a once-a-week message)
+        user_metrics = athletedata_safe("garmin_get_user_metrics", {
+            "start_date": (now - timedelta(days=14)).date().isoformat(), "end_date": activity_date,
+        })
+        # other activities Roee did the same calendar day, so a second same-day
+        # session gets read in context of the first rather than in isolation
+        other_activities_today = [
+            x for x in recent
+            if x["id"] != a["id"] and x["start_date_local"][:10] == activity_date
+        ]
 
         # easy-run HR drift baseline
         hr_drift = None
@@ -719,9 +803,13 @@ def step3_new_activity_push(state, now):
                 "daily_metrics_on_activity_date": daily_row,
                 "stress_and_body_battery_on_activity_date": stress,
             },
+            "recent_user_metrics": user_metrics,
+            "garmin_race_predictions": GARMIN_RACE_PREDICTIONS,
+            "other_activities_today": other_activities_today,
             "athletedata_load_context": load_context,
             "easy_run_hr_drift": hr_drift,
             "long_term_notes": long_term_notes(state),
+            "recent_conversation": recent_conversation(state),
         }
         text = llm_compose(
             "Compose the per-activity analysis message for this newly-completed activity, per the "
@@ -732,6 +820,8 @@ def step3_new_activity_push(state, now):
         # only commit these once the send is confirmed successful (see shoe_mileage_check docstring)
         state["shoe_alerts_sent"].extend(new_shoe_alert_keys)
         state["last_activity_id"] = str(a["id"])
+        remember_message(state, now, "activity_push", text)
+        maybe_extract_durable_note(state, f"Per-activity push: {a.get('name')}", data, text)
 
 
 # ---------------------------------------------------------------------------
@@ -882,11 +972,12 @@ def step4_weekly_summary(state, now):
         "last_week_activities": last_week,
         "acwr_context": acwr,
         "athletedata_load_context": load_context,
-        "race_predictions": race_predictions,
+        "garmin_race_predictions": race_predictions,
         "user_metrics_90d": user_metrics,
         "next_week_plan": next_week_workouts,
         "shoes": gear_all,
         "long_term_notes": long_term_notes(state),
+        "recent_conversation": recent_conversation(state),
     }
     text = llm_compose(
         "Compose the Sunday weekly summary message per the weekly-summary instructions in your system prompt.",
@@ -900,6 +991,7 @@ def step4_weekly_summary(state, now):
             traceback.print_exc()
     tg_send_message(text)
     state["last_weekly_summary_date"] = today
+    remember_message(state, now, "weekly_summary", text)
     maybe_extract_durable_note(state, "Sunday weekly summary", data, text)
 
 
@@ -911,22 +1003,30 @@ def send_test_ping():
     """Sends one Telegram message confirming the bot is reachable, and actually
     exercises the Strava and athletedata integrations rather than just replying
     with a static string - so a successful ping is real evidence those secrets
-    and connections work, not just that the process could start."""
-    lines = ["Coach is live and reachable."]
+    and connections work, not just that the process could start. Formatted with
+    the same HTML tg_send_message now sends for every real message, so this
+    doubles as a visible check that the new formatting actually renders."""
+    checks = []
 
     try:
         strava_access_token()
-        lines.append("Strava: OK (token refreshed)")
+        checks.append("Strava: OK (token refreshed)")
     except Exception:
-        lines.append("Strava: FAILED to refresh token - check STRAVA_* secrets")
+        checks.append("Strava: FAILED to refresh token - check STRAVA_* secrets")
 
     readiness = athletedata_safe("get_readiness_today")
     if readiness and readiness.get("readiness_score") is not None:
-        lines.append(f"athletedata: OK (readiness {readiness['readiness_score']}, verdict {readiness.get('verdict')})")
+        checks.append(f"athletedata: OK (readiness {readiness['readiness_score']}, verdict {readiness.get('verdict')})")
     else:
-        lines.append("athletedata: no data returned - check ATHLETEDATA_API_KEY")
+        checks.append("athletedata: no data returned - check ATHLETEDATA_API_KEY")
 
-    tg_send_message("\n".join(lines))
+    bullets = "\n".join(f"• {c}" for c in checks)
+    text = (
+        "<b>Coach is live and reachable.</b>\n\n"
+        f"{bullets}\n\n"
+        "<i>This message uses the new formatting - bold headers, bullets, and real spacing instead of one dense paragraph.</i>"
+    )
+    tg_send_message(text)
 
 
 # ---------------------------------------------------------------------------
