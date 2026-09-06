@@ -1,8 +1,13 @@
 {
   "last_activity_id": "20051036328",
   "last_telegram_update_id": 3338369,
-  "last_weekly_summary_date": "2026-08-30",
+  "last_weekly_summary_date": "2026-09-06",
   "last_morning_checkin_date": "2026-09-06",
   "shoe_alerts_sent": [],
-  "coach_notes": []
+  "coach_notes": [
+    {
+      "date": "2026-09-06",
+      "note": "Roee's easy/shakeout runs consistently show well-controlled HR (mid-130s-145s) relative to effort, and his aerobic hill-day HR staying lower than his flat volume-run HR suggests hills are his relative strength — a durable aerobic profile pattern worth tracking rather than a one-off."
+    }
+  ]
 }
