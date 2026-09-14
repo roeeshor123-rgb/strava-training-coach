@@ -1,17 +1,24 @@
 """
-Automated Strava + athletedata training coach for Roee Shor, messaging on Telegram.
+Automated Strava + Garmin training coach for Roee Shor, messaging on Telegram.
 Runs as a GitHub Actions cron job (see .github/workflows/coach.yml).
 
-Recovery/fitness data (Garmin signals, TrainingPeaks plan, cross-source PMC/load
-analytics) comes from athletedata's MCP server over plain HTTP - see
-athletedata_call() below - rather than the unofficial garminconnect library this
-used previously. Strava stays a separate direct API integration; athletedata has
-no strava_* tools for this account.
+Data sources: Strava (direct OAuth API - activities, laps, best_efforts, gear)
+and Garmin (via the unofficial garminconnect library - HRV, sleep, stress,
+VO2max, scheduled workouts, race predictions). Readiness, fitness (CTL), and
+fatigue (ATL) are NOT sourced from any third-party analytics service - they
+are computed by this script from raw Garmin/Strava inputs using standard,
+well-known sports-science formulas (Coggan's PMC model for CTL/ATL/TSB;
+HRV/RHR z-scores against a self-maintained rolling baseline for readiness).
+This previously ran on athletedata.health's cross-source analytics API, which
+computed these numbers itself - removed 2026-09-14 when Roee logged out of
+that account. See state["pmc"] and state["wellness_history"] for how the
+calculations are maintained incrementally, day over day, in state.json.
 
-Design: Python does all data fetching and deterministic math (ACWR, benchmark
-segment comparison, HR drift, shoe mileage, plan compliance). The Anthropic
-API is called once per outgoing message to compose the natural-language text
-following the STYLE_GUIDE below, given the computed data as JSON.
+Design: Python does all data fetching and deterministic math (PMC, readiness,
+ACWR, benchmark segment comparison, HR drift, shoe mileage, plan compliance).
+The Anthropic API is called once per outgoing message to compose the
+natural-language text following the STYLE_GUIDE below, given the computed
+data as JSON.
 """
 import os
 import re
@@ -31,12 +38,13 @@ STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.jso
 STRAVA_CLIENT_ID = os.environ["STRAVA_CLIENT_ID"]
 STRAVA_CLIENT_SECRET = os.environ["STRAVA_CLIENT_SECRET"]
 STRAVA_REFRESH_TOKEN = os.environ["STRAVA_REFRESH_TOKEN"]
-ATHLETEDATA_API_KEY = os.environ["ATHLETEDATA_API_KEY"]
+GARMIN_EMAIL = os.environ["GARMIN_EMAIL"]
+GARMIN_PASSWORD = os.environ["GARMIN_PASSWORD"]
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 
-STYLE_GUIDE = """You are Roee Shor's automated Strava + athletedata running/strength coach, writing him a Telegram message. Roee trains running (easy runs, volume runs, intervals, hill repeats, fartlek) plus regular weight training, in Tel Aviv. Session names are often in Hebrew (e.g. ריצת נפח = volume run, ריצת שחרור = easy/shakeout run, אינטרוולים = intervals, אימון עליות = hill repeats, פארטלק = fartlek, אימון התאוששות = recovery session) - keep Hebrew names as-is when referencing them.
+STYLE_GUIDE = """You are Roee Shor's automated Strava + Garmin running/strength coach, writing him a Telegram message. Roee trains running (easy runs, volume runs, intervals, hill repeats, fartlek) plus regular weight training, in Tel Aviv. Session names are often in Hebrew (e.g. ריצת נפח = volume run, ריצת שחרור = easy/shakeout run, אינטרוולים = intervals, אימון עליות = hill repeats, פארטלק = fartlek, אימון התאוששות = recovery session) - keep Hebrew names as-is when referencing them.
 
 FORMAT: the message is sent as Telegram HTML, so use it to make the message easy to scan on a phone, not a dense wall of text:
 - Wrap each section label (SUMMARY, WORKOUT BREAKDOWN, OVERTRAINING CHECK, etc.) and the header line in <b>bold</b> tags. Bold key numbers you want to stand out (a grade, a verdict, a PR).
@@ -53,7 +61,7 @@ If the DATA JSON includes recent_conversation, that's the actual recent chat his
 
 If the DATA JSON includes other_activities_today, Roee trained more than once today - factor the EARLIER session(s) into your read of this one (e.g. a hard interval session this morning changes what an elevated-HR easy walk tonight means; two sessions same day compounds fatigue differently than one) rather than analyzing this activity in isolation.
 
-Recovery, fitness, and plan data comes from athletedata - a cross-source analytics layer over Garmin, TrainingPeaks, and other connected platforms - not from Garmin directly. Its JSON fields routinely carry their own "note" / "disclaimer" / "verdict_note" / "freshness_note" / "_tsb_pairing_note" strings explaining exactly how that number may and may not be described (e.g. don't call a value "your Garmin recovery score" when it's athletedata's own composite; a load-flag index is explicitly "NOT a validated injury predictor" - never call it an injury risk or a diagnosis; TSB has two different conventions (start-of-day vs end-of-day) depending on which tool it came from - say which basis you're quoting if you cite it alongside CTL/ATL). Read and follow those embedded notes when composing instead of paraphrasing past them - they exist specifically to prevent misattribution to the athlete.
+Readiness, fitness (CTL), fatigue (ATL), form (TSB), and ACWR are ALL computed directly by this script from raw Garmin/Strava data (see the "note" field on each - readiness_context, pmc, acwr_context) - they are NOT Garmin's own proprietary metrics, and NOT from any third-party analytics service. Present them as exactly that: "your computed readiness is 78" not "Garmin says your readiness is 78". Garmin's role is limited to raw inputs (HRV, resting HR, sleep, VO2max) and its own genuinely-native numbers (VO2max, fitness age, race predictions) - never blur that line. readiness_context includes a `data_quality` field (how many days of baseline history exist) - if it's low (early days of this system, or after a data gap), say the number is provisional rather than presenting it with false confidence.
 
 For a per-activity analysis message, use this structure (omit any optional section that doesn't apply, given the data):
 [optional WARNING BENCHMARK ALERT line if a same-segment comparison shows both slower time AND higher HR than the prior instance]
@@ -62,7 +70,7 @@ For a per-activity analysis message, use this structure (omit any optional secti
 An emoji + activity name/type + date as a header line (running emoji for runs, weights emoji for strength)
 Grade: X/10 - one-line verdict
 
-RECOVERY CONTEXT (athletedata, before the run) - only if recovery data was available. Include VO2max and fitness age when recent_user_metrics has them (a short line is fine, e.g. "VO2max 56, fitness age 20") - this is cheap to fetch now and should show up regularly, not be treated as rare
+RECOVERY CONTEXT (before the run) - only if recovery data was available. Include VO2max and fitness age when recent_user_metrics has them (a short line is fine, e.g. "VO2max 56, fitness age 20") - this is cheap to fetch now and should show up regularly, not be treated as rare
 COACH'S PLAN - only if a scheduled workout existed for this date, prescribed vs actual
 SUMMARY - 2-3 sentences on what the session was and the headline finding
 WORKOUT BREAKDOWN - REQUIRED whenever laps or km_splits data is present in the JSON. This is the most important section - do not skip it or reduce it to an average. Use the actual per-lap/per-km numbers, not just overall averages:
@@ -72,8 +80,8 @@ WORKOUT BREAKDOWN - REQUIRED whenever laps or km_splits data is present in the J
 SAME-SEGMENT TREND - only if a genuine repeated-segment comparison exists, prior vs today
 GOOD PARTS - 2-3 specific numeric bullets, pulling from the per-lap/per-km breakdown above where possible, not just session-wide averages
 WATCH FOR - 1-3 specific bullets
-OVERTRAINING CHECK: Low/Moderate/High - blend the Strava-computed acwr_context, athletedata's own load signals (acwr/monotony/ramp_rate/load_flag from athletedata_load_context, remembering load_flag is an anomaly index, not a diagnosis) and TSB/form (from athletedata_load_context's pmc_status, stating which TSB convention you're quoting) + rest-day pattern + HR drift + plan-compliance into ONE verdict with concrete numbers plus one actionable recommendation - don't just list the three sources side by side, actually reconcile them into a single call
-FITNESS CONTEXT - garmin_race_predictions is now present in every message's DATA, same as VO2max - it's Garmin Connect's own race predictor, as reported by Roee, NOT computed by you or derived from his training data (say "your Garmin watch predicts" or similar, never present it as this script's estimate, and note the as_of date since it's a manually-updated snapshot). Use judgment on when to actually MENTION it in the message text: always fine as a one-line callback after a notably strong effort, a PR, or in the weekly summary; skip it in routine easy-run or strength messages where it adds nothing new - don't paste the same four numbers into every single message regardless of relevance.
+OVERTRAINING CHECK: Low/Moderate/High - blend acwr_context (Strava-computed), pmc (this script's computed CTL/ATL/TSB) and rest-day pattern + HR drift + plan-compliance into ONE verdict with concrete numbers plus one actionable recommendation - don't just list the sources side by side, actually reconcile them into a single call
+FITNESS CONTEXT - garmin_race_predictions is now present in every message's DATA, same as VO2max - it's Garmin Connect's own race predictor (genuinely Garmin's own number, fetched live), not computed by you or derived from his training data. Use judgment on when to actually MENTION it in the message text: always fine as a one-line callback after a notably strong effort, a PR, or in the weekly summary; skip it in routine easy-run or strength messages where it adds nothing new - don't paste the same four numbers into every single message regardless of relevance.
 
 For the 5am morning brief: render the prescribed session as warmup / main set (with concrete goal paces per segment - convert pace-zone targets to min/km directly, and for HR-zone or effort-based segments like fartlek surges, use the provided historical-pace-lookup data to state a concrete pace range) / cooldown, then a readiness-based go/adjust call, ending with one "TODAY'S GOAL" headline line naming the single most important numeric target for the session.
 
@@ -98,19 +106,23 @@ def load_state():
             "shoe_alerts_sent": [],
             "coach_notes": [],
             "message_log": [],
+            "pmc": None,
+            "wellness_history": [],
         }
     with open(STATE_PATH, encoding="utf-8") as f:
         state = json.load(f)
     # back-compat for state.json written before these existed
     state.setdefault("coach_notes", [])
     if "telegram_conversation" in state:
-        # superseded by the broader message_log below (2026-09-06) - migrate
-        # the old Q&A-only history in rather than lose it
+        # superseded by message_log (2026-09-06) - migrate the old Q&A-only
+        # history in rather than lose it
         state.setdefault("message_log", [])
         for entry in state.pop("telegram_conversation"):
             state["message_log"].append({"at": entry.get("at"), "type": "user_question", "text": entry.get("question", "")})
             state["message_log"].append({"at": entry.get("at"), "type": "qa_reply", "text": entry.get("answer", "")})
     state.setdefault("message_log", [])
+    state.setdefault("pmc", None)
+    state.setdefault("wellness_history", [])
     return state
 
 
@@ -145,12 +157,13 @@ def recent_conversation(state, limit=15):
 
 
 def maybe_extract_durable_note(state, context_label, data, message_text):
-    """After a reflection point (currently: the weekly summary), ask a small,
-    separate LLM call whether anything in this run is a genuinely durable,
-    non-obvious pattern worth remembering weeks from now - not a one-off stat.
-    This is the coach's persistent memory across runs: most calls return nothing,
-    and only real signal accumulates in state['coach_notes'] (capped at 20,
-    oldest dropped first) instead of every run starting from a blank slate."""
+    """After a reflection point (weekly summary, and every per-activity push),
+    ask a small, separate LLM call whether anything in this run is a genuinely
+    durable, non-obvious pattern worth remembering weeks from now - not a
+    one-off stat. This is the coach's persistent memory across runs: most
+    calls return nothing, and only real signal accumulates in
+    state['coach_notes'] (capped at 20, oldest dropped first) instead of every
+    run starting from a blank slate."""
     body = {
         "model": "claude-sonnet-5",
         "max_tokens": 200,
@@ -224,6 +237,21 @@ def strava_list_activities(after_epoch=None, per_page=30, page=1):
     return strava_get("athlete/activities", params)
 
 
+def strava_list_activities_all(after_epoch, per_page=100):
+    """Paginate through every activity since after_epoch - needed for PMC
+    seeding and multi-week charts, where a single 100-item page isn't enough."""
+    acts, page = [], 1
+    while True:
+        batch = strava_list_activities(after_epoch=after_epoch, per_page=per_page, page=page)
+        if not batch:
+            break
+        acts.extend(batch)
+        if len(batch) < per_page:
+            break
+        page += 1
+    return acts
+
+
 def strava_get_activity(activity_id):
     return strava_get(f"activities/{activity_id}", {"include_all_efforts": "true"})
 
@@ -283,127 +311,332 @@ def summarize_activity_detail(detail):
 
 
 # ---------------------------------------------------------------------------
-# athletedata (Garmin signals + TrainingPeaks plan + cross-source load/PMC
-# analytics, via athletedata's MCP server over plain streamable-HTTP)
+# Garmin (unofficial garminconnect library - one shared logged-in client)
 # ---------------------------------------------------------------------------
 
-ATHLETEDATA_URL = f"https://mcp.athletedata.health/mcp?apiKey={ATHLETEDATA_API_KEY}"
-
-_athletedata_call_id = 0
-
-
-def athletedata_call(tool_name, arguments=None):
-    """Call one athletedata MCP tool. This is a plain JSON-RPC 2.0 POST to a
-    streamable-HTTP MCP endpoint (auth via the apiKey query param) - no session
-    handshake or MCP SDK needed, confirmed against the live server. Raises on
-    transport/tool errors; use athletedata_safe() at call sites that should
-    degrade gracefully instead."""
-    global _athletedata_call_id
-    _athletedata_call_id += 1
-    r = requests.post(
-        ATHLETEDATA_URL,
-        headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
-        json={
-            "jsonrpc": "2.0",
-            "id": _athletedata_call_id,
-            "method": "tools/call",
-            "params": {"name": tool_name, "arguments": arguments or {}},
-        },
-        timeout=30,
-    )
-    r.raise_for_status()
-    payload = None
-    for line in r.text.splitlines():
-        if line.startswith("data:"):
-            payload = json.loads(line[len("data:"):].strip())
-            break
-    if payload is None:
-        raise RuntimeError(f"athletedata: no data line in response for {tool_name}: {r.text[:300]}")
-    if "error" in payload:
-        raise RuntimeError(f"athletedata tool {tool_name} error: {payload['error']}")
-    result = payload["result"]
-    if result.get("isError"):
-        raise RuntimeError(f"athletedata tool {tool_name} returned isError: {result}")
-    for block in result.get("content", []):
-        if block.get("type") == "text":
-            try:
-                return json.loads(block["text"])
-            except (json.JSONDecodeError, TypeError):
-                return block["text"]
-    return result
+_garmin_client = None
+_garmin_failed = False
 
 
-def athletedata_safe(tool_name, arguments=None):
-    """Call an athletedata tool, returning None on any failure. Unlike the old
-    garminconnect-based garmin_safe(), each call is an independent HTTP request -
-    one tool erroring doesn't blank out every other athletedata call for the rest
-    of this run the way a single Garmin login failure used to."""
+def garmin():
+    """Returns a logged-in Garmin client, or None if login fails (never raises)."""
+    global _garmin_client, _garmin_failed
+    if _garmin_client is not None:
+        return _garmin_client
+    if _garmin_failed:
+        return None
     try:
-        return athletedata_call(tool_name, arguments)
+        from garminconnect import Garmin
+        client = Garmin(GARMIN_EMAIL, GARMIN_PASSWORD)
+        client.login()
+        _garmin_client = client
+        return client
     except Exception:
-        print(f"athletedata call {tool_name} failed:", file=sys.stderr)
+        print("Garmin login failed, skipping Garmin enrichment for this run:", file=sys.stderr)
+        traceback.print_exc()
+        _garmin_failed = True
+        return None
+
+
+def garmin_safe(fn, *args, **kwargs):
+    """Call a garmin client method, returning None on any failure."""
+    client = garmin()
+    if client is None:
+        return None
+    try:
+        return getattr(client, fn)(*args, **kwargs)
+    except Exception:
+        print(f"Garmin call {fn} failed:", file=sys.stderr)
         traceback.print_exc()
         return None
 
 
-_planned_workouts_cache = {}
+def garmin_scheduled_workout_for_date(iso_date):
+    d = date.fromisoformat(iso_date)
+    months = {(d.year, d.month)}
+    if d.day <= 3:
+        prev = d.replace(day=1) - timedelta(days=1)
+        months.add((prev.year, prev.month))
+    if d.day >= 28:
+        nxt = (d.replace(day=28) + timedelta(days=4)).replace(day=1)
+        months.add((nxt.year, nxt.month))
+    for (y, m) in months:
+        cal = garmin_safe("get_scheduled_workouts", y, m)
+        if not cal:
+            continue
+        for item in cal.get("calendarItems", []):
+            if item.get("itemType") == "workout" and item.get("date") == iso_date:
+                return item
+    return None
 
 
-def planned_workout_for_date(iso_date):
-    """get_planned_workouts (TrainingPeaks' forward plan, Terra-bridged through
-    athletedata) returns a date-range window rather than a single day, so fetch
-    and cache the window covering iso_date and reuse it for later lookups in the
-    same run instead of one call per date."""
-    if iso_date not in _planned_workouts_cache:
-        d = date.fromisoformat(iso_date)
-        start = (d - timedelta(days=10)).isoformat()
-        end = (d + timedelta(days=14)).isoformat()
-        result = athletedata_safe("get_planned_workouts", {"start_date": start, "end_date": end})
-        for s in (result or {}).get("sessions") or []:
-            _planned_workouts_cache[s["date"]] = s
-    return _planned_workouts_cache.get(iso_date)
+# Garmin Connect's own race predictor (its real algorithm - VO2max/training-history
+# based, computed on-device/in the Garmin cloud). Fetched live via garminconnect
+# below; this is only the fallback used if that live call ever fails, so a
+# transient Garmin outage degrades to a stale-but-real number instead of nothing.
+GARMIN_RACE_PREDICTIONS_FALLBACK = {
+    "as_of": "2026-09-02",
+    "source": "Garmin Connect's own race predictor - fallback value, last confirmed live",
+    "live": False,
+    "predicted_times_s": {
+        "5k": 19 * 60 + 56,
+        "10k": 42 * 60 + 9,
+        "half_marathon": 1 * 3600 + 33 * 60 + 22,
+        "marathon": 3 * 3600 + 25 * 60 + 2,
+    },
+}
+
+_race_predictions_cache = None
 
 
-_daily_metrics_cache = {}
+def live_garmin_race_predictions():
+    """Fetch Garmin Connect's own race-predictor numbers live via garminconnect.
+    Cached per-run (it's the same client, same answer, called from up to 4
+    places). Falls back to GARMIN_RACE_PREDICTIONS_FALLBACK on any failure -
+    a stale real number beats no number, and beats guessing one ourselves
+    (Roee explicitly rejected computed/derived race predictions - he wants
+    Garmin's own reading specifically)."""
+    global _race_predictions_cache
+    if _race_predictions_cache is not None:
+        return _race_predictions_cache
+    raw = garmin_safe("get_race_predictions")
+    result = None
+    if raw:
+        try:
+            predicted = {
+                "5k": raw.get("time5K"),
+                "10k": raw.get("time10K"),
+                "half_marathon": raw.get("timeHalfMarathon"),
+                "marathon": raw.get("timeMarathon"),
+            }
+            if any(v is not None for v in predicted.values()):
+                result = {
+                    "as_of": datetime.now(TZ).date().isoformat(),
+                    "source": "Garmin Connect's own race predictor, fetched live this run",
+                    "live": True,
+                    "predicted_times_s": predicted,
+                    "raw": raw,
+                }
+        except Exception:
+            traceback.print_exc()
+    if result is None:
+        result = GARMIN_RACE_PREDICTIONS_FALLBACK
+    _race_predictions_cache = result
+    return result
 
 
-def daily_metrics_row_for_date(iso_date, context_days=1):
-    """Return the get_daily_metrics row for iso_date (athletedata's merged-across-
-    providers HRV/RHR/sleep/readiness/ACWR/monotony/injury-risk/CTL/ATL/TSB rollup
-    for that day), fetching+caching a small window around it if not already cached."""
-    if iso_date not in _daily_metrics_cache:
-        d = date.fromisoformat(iso_date)
-        start = (d - timedelta(days=context_days)).isoformat()
-        end = (d + timedelta(days=context_days)).isoformat()
-        result = athletedata_safe("get_daily_metrics", {"start": start, "end": end})
-        for row in (result or {}).get("rows") or []:
-            _daily_metrics_cache[row["date"]] = row
-    return _daily_metrics_cache.get(iso_date)
+# ---------------------------------------------------------------------------
+# Self-computed analytics: PMC (fitness/fatigue/form) + readiness
+#
+# Neither of these comes from Garmin, TrainingPeaks, or any third-party
+# analytics service - they're computed here from raw inputs using standard,
+# published sports-science formulas, and maintained INCREMENTALLY in
+# state.json (one day-step per run) rather than recomputed from scratch each
+# time, both because that's the mathematically correct way to run an EWMA and
+# because it avoids re-fetching months of history on every 10-minute tick.
+# ---------------------------------------------------------------------------
+
+PMC_CTL_DAYS = 42.0   # Coggan's standard chronic-load (fitness) time constant
+PMC_ATL_DAYS = 7.0    # Coggan's standard acute-load (fatigue) time constant
 
 
-def daily_metrics_range(start_date, end_date):
-    """Return {date: row} for [start_date, end_date], fetching+caching whichever
-    dates in that range aren't already cached."""
-    d0, d1 = date.fromisoformat(start_date), date.fromisoformat(end_date)
-    needed = [(d0 + timedelta(days=i)).isoformat() for i in range((d1 - d0).days + 1)]
-    missing = [d for d in needed if d not in _daily_metrics_cache]
-    if missing:
-        result = athletedata_safe("get_daily_metrics", {"start": min(missing), "end": max(missing)})
-        for row in (result or {}).get("rows") or []:
-            _daily_metrics_cache[row["date"]] = row
-    return {d: _daily_metrics_cache[d] for d in needed if d in _daily_metrics_cache}
+def _strava_daily_loads(start_date, end_date):
+    """{iso_date: summed relative_effort} for every day in [start_date, end_date],
+    across ALL activities (not just runs) - Coggan's model wants total daily
+    training stress, not one sport in isolation."""
+    after_epoch = int(datetime.combine(start_date, datetime.min.time(), TZ).timestamp())
+    acts = strava_list_activities_all(after_epoch=after_epoch)
+    by_day = {}
+    d = start_date
+    while d <= end_date:
+        by_day[d.isoformat()] = 0
+        d += timedelta(days=1)
+    for a in acts:
+        day = a["start_date_local"][:10]
+        if day in by_day:
+            by_day[day] += a.get("suffer_score") or 0
+    return by_day
 
 
-def athletedata_load_context():
-    """Current (as-of-today) cross-source load/fitness signals: athletedata's own
-    ACWR/monotony/ramp-rate + load-anomaly flag (NOT a validated injury predictor -
-    see its disclaimer) + PMC (CTL/ATL/TSB). This is the athletedata leg of the
-    three-way OVERTRAINING CHECK blend, alongside the existing Strava-only
-    acwr_context() and per-activity HR-drift/plan-compliance checks."""
+def seed_pmc(now, lookback_days=90):
+    """One-time initialization of CTL/ATL from real history (used the first
+    time this runs, or after a gap of more than a few days) rather than
+    starting both at 0 and taking ~2-3 months to converge. lookback_days=90
+    is a reasonable balance of accuracy vs one Strava history fetch."""
+    start = (now.date() - timedelta(days=lookback_days))
+    loads = _strava_daily_loads(start, now.date())
+    ctl = atl = 0.0
+    for d in sorted(loads):
+        load = loads[d]
+        ctl += (load - ctl) / PMC_CTL_DAYS
+        atl += (load - atl) / PMC_ATL_DAYS
+    return {"date": now.date().isoformat(), "ctl": round(ctl, 1), "atl": round(atl, 1)}
+
+
+def update_and_get_pmc(state, now):
+    """Advance state['pmc'] by exactly the days elapsed since it was last
+    updated (backfilling day-by-day if the script didn't run for a while, so
+    the EWMA isn't skipped forward incorrectly), then return the current
+    CTL/ATL/TSB. Seeds from 90 days of real Strava history on first run."""
+    today = now.date()
+    pmc = state.get("pmc")
+    if pmc is None or (today - date.fromisoformat(pmc["date"])).days > 120:
+        # no state yet, or so stale a fresh seed is more honest than a huge backfill
+        pmc = seed_pmc(now)
+        state["pmc"] = pmc
+        return {**pmc, "tsb": round(pmc["ctl"] - pmc["atl"], 1), "note": "Seeded from 90 days of real Strava history."}
+
+    last_date = date.fromisoformat(pmc["date"])
+    if last_date < today:
+        loads = _strava_daily_loads(last_date + timedelta(days=1), today)
+        ctl, atl = pmc["ctl"], pmc["atl"]
+        d = last_date + timedelta(days=1)
+        while d <= today:
+            load = loads.get(d.isoformat(), 0)
+            ctl += (load - ctl) / PMC_CTL_DAYS
+            atl += (load - atl) / PMC_ATL_DAYS
+            d += timedelta(days=1)
+        pmc = {"date": today.isoformat(), "ctl": round(ctl, 1), "atl": round(atl, 1)}
+        state["pmc"] = pmc
+
     return {
-        "load_balance": athletedata_safe("get_load_balance", {"days": 28}),
-        "load_flag": athletedata_safe("get_load_flag"),
-        "pmc_status": athletedata_safe("get_pmc_status"),
+        **pmc,
+        "tsb": round(pmc["ctl"] - pmc["atl"], 1),
+        "note": (
+            "ctl = chronic load (fitness, 42-day exponentially-weighted average of daily Strava relative_effort "
+            "across all sports); atl = acute load (fatigue, 7-day EWMA of the same); tsb = ctl - atl (form, this is "
+            "END-OF-DAY convention: today's own ctl minus atl including today's load). All computed by this script, "
+            "not sourced from Garmin/TrainingPeaks/any third-party service - present them as this script's own numbers."
+        ),
+    }
+
+
+def acwr_context(now):
+    """Sum relative_effort (Strava suffer_score) trailing 7 days vs preceding 7 days."""
+    after_epoch = int((now - timedelta(days=14)).timestamp())
+    acts = strava_list_activities_all(after_epoch=after_epoch)
+
+    trailing, preceding = 0, 0
+    days_with_activity = set()
+    for a in acts:
+        start = datetime.fromisoformat(a["start_date_local"].replace("Z", "")).replace(tzinfo=TZ)
+        days_ago = (now.date() - start.date()).days
+        effort = a.get("suffer_score") or 0
+        if 0 <= days_ago < 7:
+            trailing += effort
+            days_with_activity.add(start.date())
+        elif 7 <= days_ago < 14:
+            preceding += effort
+        if 0 <= days_ago < 14:
+            days_with_activity.add(start.date())
+
+    acwr = round(trailing / preceding, 2) if preceding else None
+    no_rest_day = len(days_with_activity) >= 14
+    return {"trailing_7d_effort": trailing, "preceding_7d_effort": preceding, "acwr": acwr,
+            "zero_full_rest_day_in_14d": no_rest_day}
+
+
+def _mean_stdev(values):
+    if not values:
+        return None, None
+    mean = sum(values) / len(values)
+    if len(values) < 2:
+        return mean, None
+    variance = sum((v - mean) ** 2 for v in values) / (len(values) - 1)
+    return mean, variance ** 0.5
+
+
+def update_and_get_readiness(state, now):
+    """Fetch today's Garmin HRV + resting HR (if not already recorded today),
+    append to a rolling baseline kept in state['wellness_history'] (capped 90
+    days), then compute a 0-100 readiness score from today's z-scores against
+    that self-built baseline plus sleep debt. Genuinely gets more accurate the
+    longer this runs - a real, if simple, form of the system 'learning'."""
+    today = now.date().isoformat()
+    history = state.get("wellness_history", [])
+    today_entry = next((h for h in history if h["date"] == today), None)
+
+    if today_entry is None:
+        hrv_raw = garmin_safe("get_hrv_data", today)
+        rhr_raw = garmin_safe("get_rhr_day", today)
+        hrv_val = None
+        try:
+            hrv_val = hrv_raw["hrvSummary"]["lastNightAvg"]
+        except (TypeError, KeyError):
+            pass
+        rhr_val = None
+        try:
+            rhr_val = rhr_raw["allMetrics"]["metricsMap"]["WELLNESS_RESTING_HEART_RATE"][0]["value"]
+        except (TypeError, KeyError, IndexError):
+            pass
+        if hrv_val is not None or rhr_val is not None:
+            today_entry = {"date": today, "hrv": hrv_val, "rhr": rhr_val}
+            history.append(today_entry)
+            history = history[-90:]
+            state["wellness_history"] = history
+
+    if today_entry is None or (today_entry.get("hrv") is None and today_entry.get("rhr") is None):
+        return {"status": "no_data", "note": "No Garmin HRV/resting-HR sync found for today - readiness not computed this run."}
+
+    baseline = [h for h in history if h["date"] != today]
+    hrv_hist = [h["hrv"] for h in baseline if h.get("hrv") is not None]
+    rhr_hist = [h["rhr"] for h in baseline if h.get("rhr") is not None]
+    hrv_mean, hrv_sd = _mean_stdev(hrv_hist)
+    rhr_mean, rhr_sd = _mean_stdev(rhr_hist)
+
+    hrv_z = (today_entry["hrv"] - hrv_mean) / hrv_sd if today_entry.get("hrv") is not None and hrv_sd else None
+    rhr_z = (today_entry["rhr"] - rhr_mean) / rhr_sd if today_entry.get("rhr") is not None and rhr_sd else None
+
+    sleep_raw = garmin_safe("get_sleep_data", today)
+    sleep_debt_min = None
+    sleep_hours = None
+    try:
+        sleep_seconds = sleep_raw["dailySleepDTO"]["sleepTimeSeconds"]
+        sleep_hours = round(sleep_seconds / 3600, 1)
+        sleep_debt_min = round(max(0, 450 - sleep_seconds / 60))  # 7.5h personal-need assumption
+    except (TypeError, KeyError):
+        pass
+
+    score = 50.0
+    if hrv_z is not None:
+        score += hrv_z * 15
+    if rhr_z is not None:
+        score -= rhr_z * 15
+    if sleep_debt_min is not None:
+        score -= min(sleep_debt_min / 15, 20)
+    score = round(max(0, min(100, score)))
+
+    if score >= 75:
+        verdict = "go_hard"
+    elif score >= 50:
+        verdict = "steady"
+    elif score >= 35:
+        verdict = "easy"
+    else:
+        verdict = "rest"
+
+    return {
+        "status": "ok",
+        "readiness_score": score,
+        "verdict": verdict,
+        "hrv_today": today_entry.get("hrv"),
+        "hrv_baseline_mean": round(hrv_mean, 1) if hrv_mean else None,
+        "hrv_z": round(hrv_z, 2) if hrv_z is not None else None,
+        "rhr_today": today_entry.get("rhr"),
+        "rhr_baseline_mean": round(rhr_mean, 1) if rhr_mean else None,
+        "rhr_z": round(rhr_z, 2) if rhr_z is not None else None,
+        "sleep_hours": sleep_hours,
+        "sleep_debt_min": sleep_debt_min,
+        "data_quality": {
+            "baseline_days": max(len(hrv_hist), len(rhr_hist)),
+            "provisional": max(len(hrv_hist), len(rhr_hist)) < 14,
+        },
+        "note": (
+            "Computed by this script from Garmin's raw HRV/resting-HR/sleep data, z-scored against a rolling "
+            "self-built baseline (see data_quality.baseline_days) - not Garmin's own recovery score (Garmin "
+            "doesn't publish one) and not any third-party analytics number. Bands: go_hard >=75, steady >=50, "
+            "easy >=35, rest >=0. If data_quality.provisional is true, say the number is still an early estimate."
+        ),
     }
 
 
@@ -533,64 +766,6 @@ def llm_compose(task_instructions, data):
     return text
 
 
-# ---------------------------------------------------------------------------
-# Deterministic math helpers
-# ---------------------------------------------------------------------------
-
-def acwr_context(now):
-    """Sum relative_effort (Strava suffer_score) trailing 7 days vs preceding 7 days."""
-    after_epoch = int((now - timedelta(days=14)).timestamp())
-    acts = []
-    page = 1
-    while True:
-        batch = strava_list_activities(after_epoch=after_epoch, per_page=100, page=page)
-        if not batch:
-            break
-        acts.extend(batch)
-        if len(batch) < 100:
-            break
-        page += 1
-
-    trailing, preceding = 0, 0
-    days_with_activity = set()
-    for a in acts:
-        start = datetime.fromisoformat(a["start_date_local"].replace("Z", "")).replace(tzinfo=TZ)
-        days_ago = (now.date() - start.date()).days
-        effort = a.get("suffer_score") or 0
-        if 0 <= days_ago < 7:
-            trailing += effort
-            days_with_activity.add(start.date())
-        elif 7 <= days_ago < 14:
-            preceding += effort
-        if 0 <= days_ago < 14:
-            days_with_activity.add(start.date())
-
-    acwr = round(trailing / preceding, 2) if preceding else None
-    no_rest_day = len(days_with_activity) >= 14
-    return {"trailing_7d_effort": trailing, "preceding_7d_effort": preceding, "acwr": acwr,
-            "zero_full_rest_day_in_14d": no_rest_day}
-
-
-# Garmin Connect's own race predictor (its real algorithm - VO2max/training-history
-# based, computed on-device/in the Garmin cloud). Not available through athletedata's
-# API, and the only other way to reach it is the deprecated unofficial garminconnect
-# library this repo intentionally dropped - so this is entered by hand from what
-# Garmin Connect shows, and updated whenever Roee reports a new reading. Deliberately
-# NOT derived from Strava best_efforts or any Riegel/third-party recomputation -
-# Roee asked for Garmin's actual number specifically, not an estimate off his raw
-# training data.
-GARMIN_RACE_PREDICTIONS = {
-    "as_of": "2026-09-02",
-    "source": "Garmin Connect's own race predictor, reported by Roee - not computed by this script",
-    "predicted_times_s": {
-        "5k": 19 * 60 + 56,
-        "10k": 42 * 60 + 9,
-        "half_marathon": 1 * 3600 + 33 * 60 + 22,
-        "marathon": 3 * 3600 + 25 * 60 + 2,
-    },
-}
-
-
 def find_benchmark_comparison(activity_detail, sport_type, before_epoch):
     """Look at up to 2 recent same-sport activities for a shared segment_id, return best comparison."""
     segs = activity_detail.get("segment_efforts") or []
@@ -643,17 +818,16 @@ def step1_morning_brief(state, now):
     today = now.date().isoformat()
     if now.hour != 5 or state.get("last_morning_checkin_date") == today:
         return
-    workout = planned_workout_for_date(today)
+    workout = garmin_scheduled_workout_for_date(today)
     if not workout:
         state["last_morning_checkin_date"] = today
         return
 
-    readiness = athletedata_safe("get_readiness_today")
-    daily_row = daily_metrics_row_for_date(today)
-    stress = athletedata_safe("garmin_get_stress", {"start_date": today, "end_date": today})
-    user_metrics = athletedata_safe("garmin_get_user_metrics", {
-        "start_date": (now - timedelta(days=14)).date().isoformat(), "end_date": today,
-    })
+    detail = garmin_safe("get_workout_by_id", workout["workoutId"])
+    readiness = update_and_get_readiness(state, now)
+    pmc = update_and_get_pmc(state, now)
+    body_battery = garmin_safe("get_body_battery", today)
+    user_metrics = garmin_safe("get_max_metrics", today)
 
     # pull recent activities of similar name for pace-lookup context
     recent = strava_list_activities(after_epoch=int((now - timedelta(days=45)).timestamp()), per_page=30)
@@ -664,12 +838,12 @@ def step1_morning_brief(state, now):
 
     data = {
         "workout_title": title,
-        "workout_structure": workout,
-        "readiness_today": readiness,
-        "daily_metrics_today": daily_row,
-        "stress_and_body_battery": stress,
+        "workout_structure": detail,
+        "readiness_context": readiness,
+        "pmc": pmc,
+        "body_battery": body_battery,
         "recent_user_metrics": user_metrics,
-        "garmin_race_predictions": GARMIN_RACE_PREDICTIONS,
+        "garmin_race_predictions": live_garmin_race_predictions(),
         "similar_recent_sessions": similar_detail,
         "long_term_notes": long_term_notes(state),
         "recent_conversation": recent_conversation(state),
@@ -715,7 +889,7 @@ def step2_telegram_qa(state, now):
             "today": now.date().isoformat(),
             "recent_activities_summary": recent,
             "recent_runs_with_lap_and_split_detail": detailed_runs,
-            "garmin_race_predictions": GARMIN_RACE_PREDICTIONS,
+            "garmin_race_predictions": live_garmin_race_predictions(),
             "recent_conversation": recent_conversation(state),
             "long_term_notes": long_term_notes(state),
         }
@@ -754,19 +928,13 @@ def step3_new_activity_push(state, now):
         shoe_info, shoe_alerts, new_shoe_alert_keys = shoe_mileage_check(a, state)
 
         activity_date = a["start_date_local"][:10]
-        workout = planned_workout_for_date(activity_date)
+        workout = garmin_scheduled_workout_for_date(activity_date)
+        workout_detail = garmin_safe("get_workout_by_id", workout["workoutId"]) if workout else None
 
-        daily_row = daily_metrics_row_for_date(activity_date)
-        stress = athletedata_safe("garmin_get_stress", {"start_date": activity_date, "end_date": activity_date})
-        load_context = athletedata_load_context()
-        # VO2max/fitness age: cheap single call, fetched every push now (was
-        # weekly-only before, which was the actual bug - Roee wants to see it
-        # regularly, not buried in a once-a-week message)
-        user_metrics = athletedata_safe("garmin_get_user_metrics", {
-            "start_date": (now - timedelta(days=14)).date().isoformat(), "end_date": activity_date,
-        })
-        # other activities Roee did the same calendar day, so a second same-day
-        # session gets read in context of the first rather than in isolation
+        readiness = update_and_get_readiness(state, now)
+        pmc = update_and_get_pmc(state, now)
+        body_battery = garmin_safe("get_body_battery", activity_date)
+        user_metrics = garmin_safe("get_max_metrics", activity_date)
         other_activities_today = [
             x for x in recent
             if x["id"] != a["id"] and x["start_date_local"][:10] == activity_date
@@ -798,15 +966,15 @@ def step3_new_activity_push(state, now):
             "benchmark_segment_comparison": benchmark,
             "shoe_info": shoe_info,
             "shoe_mileage_alerts": shoe_alerts,
-            "coach_plan_for_this_date": workout,
+            "coach_plan_for_this_date": workout_detail,
             "recovery_context": {
-                "daily_metrics_on_activity_date": daily_row,
-                "stress_and_body_battery_on_activity_date": stress,
+                "readiness_context": readiness,
+                "pmc": pmc,
+                "body_battery": body_battery,
             },
             "recent_user_metrics": user_metrics,
-            "garmin_race_predictions": GARMIN_RACE_PREDICTIONS,
+            "garmin_race_predictions": live_garmin_race_predictions(),
             "other_activities_today": other_activities_today,
-            "athletedata_load_context": load_context,
             "easy_run_hr_drift": hr_drift,
             "long_term_notes": long_term_notes(state),
             "recent_conversation": recent_conversation(state),
@@ -828,7 +996,7 @@ def step3_new_activity_push(state, now):
 # Step 4: Sunday weekly summary
 # ---------------------------------------------------------------------------
 
-def make_weekly_charts(activities, daily_rows_14d, out_dir):
+def make_weekly_charts(activities, wellness_history, out_dir):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -879,14 +1047,12 @@ def make_weekly_charts(activities, daily_rows_14d, out_dir):
     fig.savefig(path_a, dpi=150)
     plt.close(fig)
 
-    # HRV + RHR, last 14 days (single athletedata get_daily_metrics window, passed in
-    # by the caller and already cached/deduped there - not one call per day)
+    # HRV + RHR, last 14 days - from state['wellness_history'], the same rolling
+    # baseline update_and_get_readiness() maintains (no extra Garmin calls here)
     days = [(datetime.now(TZ).date() - timedelta(days=i)) for i in range(13, -1, -1)]
-    hrv_vals, rhr_vals = [], []
-    for d in days:
-        row = daily_rows_14d.get(d.isoformat())
-        hrv_vals.append(row.get("hrv") if row else None)
-        rhr_vals.append(row.get("restingHr") if row else None)
+    by_date = {h["date"]: h for h in wellness_history}
+    hrv_vals = [by_date.get(d.isoformat(), {}).get("hrv") for d in days]
+    rhr_vals = [by_date.get(d.isoformat(), {}).get("rhr") for d in days]
 
     fig, ax1 = plt.subplots(figsize=(11, 6))
     ax2 = ax1.twinx()
@@ -915,16 +1081,7 @@ def step4_weekly_summary(state, now):
         return
 
     after_epoch = int((now - timedelta(weeks=13)).timestamp())
-    all_acts = []
-    page = 1
-    while True:
-        batch = strava_list_activities(after_epoch=after_epoch, per_page=100, page=page)
-        if not batch:
-            break
-        all_acts.extend(batch)
-        if len(batch) < 100:
-            break
-        page += 1
+    all_acts = strava_list_activities_all(after_epoch=after_epoch)
 
     this_week = [a for a in all_acts if (now.date() - datetime.fromisoformat(a["start_date_local"].replace("Z", "")).date()).days < 7]
     last_week = [a for a in all_acts if 7 <= (now.date() - datetime.fromisoformat(a["start_date_local"].replace("Z", "")).date()).days < 14]
@@ -932,19 +1089,14 @@ def step4_weekly_summary(state, now):
     next_week_workouts = []
     for i in range(7):
         d = (now.date() + timedelta(days=i)).isoformat()
-        w = planned_workout_for_date(d)
+        w = garmin_scheduled_workout_for_date(d)
         if w:
             next_week_workouts.append({"date": d, "title": w.get("title")})
 
-    load_context = athletedata_load_context()
-    # race predictions: Garmin Connect's own race predictor, reported by Roee - not
-    # athletedata's get_performance_estimates (its own cross-source algorithm, not a
-    # Garmin passthrough) and not a Riegel recomputation off Strava data - Roee asked
-    # for Garmin's actual number specifically, see GARMIN_RACE_PREDICTIONS above
-    race_predictions = GARMIN_RACE_PREDICTIONS
-    user_metrics = athletedata_safe("garmin_get_user_metrics", {
-        "start_date": (now - timedelta(days=90)).date().isoformat(), "end_date": today,
-    })
+    readiness = update_and_get_readiness(state, now)
+    pmc = update_and_get_pmc(state, now)
+    race_predictions = live_garmin_race_predictions()
+    user_metrics = garmin_safe("get_max_metrics", today)
 
     gear_all = []
     seen_gear = set()
@@ -957,11 +1109,9 @@ def step4_weekly_summary(state, now):
             except Exception:
                 pass
 
-    daily_rows_14d = daily_metrics_range((now - timedelta(days=13)).date().isoformat(), today)
-
     tmp_dir = tempfile.mkdtemp()
     try:
-        chart_paths = make_weekly_charts(all_acts, daily_rows_14d, tmp_dir)
+        chart_paths = make_weekly_charts(all_acts, state.get("wellness_history", []), tmp_dir)
     except Exception:
         traceback.print_exc()
         chart_paths = []
@@ -971,7 +1121,8 @@ def step4_weekly_summary(state, now):
         "this_week_activities": this_week,
         "last_week_activities": last_week,
         "acwr_context": acwr,
-        "athletedata_load_context": load_context,
+        "readiness_context": readiness,
+        "pmc": pmc,
         "garmin_race_predictions": race_predictions,
         "user_metrics_90d": user_metrics,
         "next_week_plan": next_week_workouts,
@@ -1001,11 +1152,11 @@ def step4_weekly_summary(state, now):
 
 def send_test_ping():
     """Sends one Telegram message confirming the bot is reachable, and actually
-    exercises the Strava and athletedata integrations rather than just replying
-    with a static string - so a successful ping is real evidence those secrets
-    and connections work, not just that the process could start. Formatted with
-    the same HTML tg_send_message now sends for every real message, so this
-    doubles as a visible check that the new formatting actually renders."""
+    exercises the Strava and Garmin integrations plus the self-computed PMC/
+    readiness math rather than just replying with a static string - so a
+    successful ping is real evidence those secrets and connections work.
+    Formatted with the same HTML tg_send_message now sends for every real
+    message, so this doubles as a visible check that formatting renders."""
     checks = []
 
     try:
@@ -1014,11 +1165,27 @@ def send_test_ping():
     except Exception:
         checks.append("Strava: FAILED to refresh token - check STRAVA_* secrets")
 
-    readiness = athletedata_safe("get_readiness_today")
-    if readiness and readiness.get("readiness_score") is not None:
-        checks.append(f"athletedata: OK (readiness {readiness['readiness_score']}, verdict {readiness.get('verdict')})")
+    client = garmin()
+    if client is not None:
+        checks.append("Garmin: OK (logged in)")
     else:
-        checks.append("athletedata: no data returned - check ATHLETEDATA_API_KEY")
+        checks.append("Garmin: FAILED to log in - check GARMIN_EMAIL/GARMIN_PASSWORD secrets")
+
+    now = datetime.now(TZ)
+    scratch_state = {"pmc": None, "wellness_history": []}
+    try:
+        pmc = update_and_get_pmc(scratch_state, now)
+        checks.append(f"PMC (computed): OK (CTL {pmc['ctl']}, ATL {pmc['atl']}, TSB {pmc['tsb']})")
+    except Exception:
+        traceback.print_exc()
+        checks.append("PMC (computed): FAILED - check Strava history fetch")
+
+    if client is not None:
+        readiness = update_and_get_readiness(scratch_state, now)
+        if readiness.get("status") == "ok":
+            checks.append(f"Readiness (computed): OK ({readiness['readiness_score']}, {readiness['verdict']})")
+        else:
+            checks.append("Readiness (computed): no Garmin HRV/RHR data synced yet today")
 
     bullets = "\n".join(f"• {c}" for c in checks)
     text = (
