@@ -7,67 +7,23 @@
   "coach_notes": [
     {
       "date": "2026-09-06",
-      "note": "Roee's easy/shakeout runs consistently show well-controlled HR (mid-130s-145s) relative to effort, and his aerobic hill-day HR staying lower than his flat volume-run HR suggests hills are his relative strength — a durable aerobic profile pattern worth tracking rather than a one-off."
-    },
-    {
-      "date": "2026-09-06",
-      "note": "His weight training sessions consistently run as low-cardiovascular-strain work (avg HR in the 80s) that slots cleanly around his running load without adding to fatigue, making strength days a reliable low-risk placeholder even when running-driven fatigue (TSB) is deeply negative."
-    },
-    {
-      "date": "2026-09-07",
-      "note": "In fartlek/surge-float sessions, Roee tends to hold prescribed paces well but lets HR drift progressively upward rep-to-rep (surges creeping toward max HR, floats failing to drop back into target range), indicating a pattern of pacing discipline without matching intensity discipline."
+      "note": "Roee's easy/shakeout runs consistently show well-controlled HR (mid-130s-145s) relative to effort, and his aerobic hill-day HR staying lower than his flat volume-run HR suggests hills are his relative strength - a durable aerobic profile pattern worth tracking rather than a one-off."
     },
     {
       "date": "2026-09-08",
-      "note": "Roee has a consistent pattern of running \"easy\"/recovery-labeled sessions at moderate effort (pace and HR both drifting above prescribed ceilings after the first 2-3km), suggesting he struggles to genuinely back off intensity on designated easy days even when explicitly warned in advance."
+      "note": "Roee's weight-training sessions consistently run as low-cardiovascular-strain work (avg HR in the 80s-90s) that's genuinely safe on its own - but he also uses them (and other easy-labeled sessions) as an excuse to avoid taking genuine full rest days, letting rest-day debt accumulate even when each individual session looks fine."
     },
     {
-      "date": "2026-09-08",
-      "note": "Roee's weight-training sessions are the one part of his training he reliably keeps low-intensity, but he uses them (and other easy-labeled sessions) as an excuse to avoid taking genuine full rest days, letting rest-day debt accumulate even when each individual session looks fine."
-    },
-    {
-      "date": "2026-09-09",
-      "note": "Roee has gone 4+ weeks (across multiple flagged instances) without ever taking a genuine full rest day, repeatedly substituting low-strain strength sessions or moderate \"easy\" runs instead, even when explicitly told the next day must be zero training."
-    },
-    {
-      "date": "2026-09-09",
-      "note": "Roee treats his clean, low-strain strength sessions as license to skip genuine rest days, repeatedly stacking lifts onto the same day as hard runs and letting rest-day debt compound for weeks despite the sessions themselves being individually low-risk."
-    },
-    {
-      "date": "2026-09-09",
-      "note": "Roee treats \"one more low-strain session\" as always justifiable in isolation, which is exactly how he's turned a single overdue rest day into an ever-compounding debt — even explicit same-day warnings don't stop him from adding a third session."
-    },
-    {
-      "date": "2026-09-10",
-      "note": "Roee treats each individually low-strain session (especially weight training) as license to keep stacking multiple sessions per day, so flagged rest-day debt never actually gets paid down even after six-plus consecutive warnings — the pattern only breaks if a day is scheduled with literally nothing on it, not another \"easy\" add-on."
+      "date": "2026-09-14",
+      "note": "Roee's fartlek/surge-float sessions show a highly repeatable failure mode - pacing stays tight rep-to-rep but HR creeps progressively higher (surges climbing toward 180s+, floats failing to drop below ~150-165bpm) - and this exact shape has now recurred across separate fartleks weeks apart regardless of fatigue backdrop, making it a session-type-specific signature rather than a one-off."
     },
     {
       "date": "2026-09-11",
-      "note": "Roee consistently converts every \"easy\"/recovery-labeled run into moderate-to-hard effort by km3-4 (HR drifting into the 150s-160s+ while pace holds), a pacing/effort-discipline gap distinct from his rest-day-avoidance pattern and one that persists even when his HR-per-pace ratio shows fitness is fine."
-    },
-    {
-      "date": "2026-09-12",
-      "note": "Roee consistently overrides explicit \"make tomorrow a true zero-training day\" directives by substituting a \"productive\" session instead of actually resting — the rest-day debt has run 9+ consecutive sessions deep and never once resolved via a scheduled rest day, only via external circumstance."
-    },
-    {
-      "date": "2026-09-13",
-      "note": "Even explicit next-day \"must be zero training\" directives get overridden by scheduling a hard workout instead, meaning verbal/written rest-day mandates alone are not sufficient to change his behavior — the pattern only breaks with an actual empty calendar day."
-    },
-    {
-      "date": "2026-09-13",
-      "note": "Roee never converts a flagged \"must be a true zero-training day\" into an actual rest day—he substitutes a low-strain lift or padel session instead, so rest-day debt has run 10+ sessions deep and only external circumstance, not explicit warnings, has ever broken it."
-    },
-    {
-      "date": "2026-09-14",
-      "note": "Roee's fartlek/surge-float sessions show a highly repeatable failure mode - pacing stays tight rep-to-rep but HR creeps progressively higher (surges climbing toward 180s+, floats failing to drop below ~150-165bpm), and this exact shape has now recurred across separate fartleks weeks apart regardless of fatigue backdrop, making it a session-type-specific signature rather than a one-off."
-    },
-    {
-      "date": "2026-09-14",
-      "note": "Roee only ever breaks an explicit \"next day must be zero training\" directive by scheduling another individually low-strain session (usually weight training) rather than a hard workout, treating each clean lift as self-justifying even when it's the second or third session stacked that same day — meaning warnings alone never work and only a literally blank calendar day interrupts the pattern."
+      "note": "Roee consistently converts every \"easy\"/recovery-labeled run into moderate-to-hard effort by km3-4 (HR drifting into the 150s-160s+ while pace holds) - a pacing/effort-discipline gap distinct from his rest-day-avoidance pattern, persisting even when his HR-per-pace ratio shows fitness is fine."
     },
     {
       "date": "2026-09-15",
-      "note": "Even when a \"clean\" easy run finally shows genuinely controlled HR and low suffer score, Roee treats that as evidence he can keep skipping rest rather than as the cue to actually take one."
+      "note": "Roee never converts an explicit \"next day must be zero training\" directive into an actual rest day - he substitutes a low-strain session (a lift or padel) instead every time, and even treats a session that finally shows clean/controlled numbers as proof he can keep skipping rest rather than as the cue to actually take one. Only external circumstance, never an explicit warning, has ever broken the streak - which by Sept 15 had run 12+ consecutive sessions deep."
     }
   ],
   "message_log": [
