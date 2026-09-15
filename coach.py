@@ -162,23 +162,42 @@ def maybe_extract_durable_note(state, context_label, data, message_text):
     durable, non-obvious pattern worth remembering weeks from now - not a
     one-off stat. This is the coach's persistent memory across runs: most
     calls return nothing, and only real signal accumulates in
-    state['coach_notes'] (capped at 20, oldest dropped first) instead of every
-    run starting from a blank slate."""
+    state['coach_notes'] (capped at 15, oldest dropped first) instead of every
+    run starting from a blank slate.
+
+    The call also sees the EXISTING notes and is asked to consolidate: a
+    recurring pattern (e.g. "still hasn't taken a rest day") should sharpen/
+    update its existing note in place, not pile up a slightly-reworded restate
+    every time it recurs. Without this, a genuinely persistent pattern (the
+    most interesting kind - it's still true weeks later) is exactly the kind
+    that floods the list with near-duplicates, since it gets re-flagged most
+    often. First observed as a real problem 2026-09-15: 8 of 15 accumulated
+    notes were near-duplicate restatements of one rest-day-debt pattern."""
+    existing = state.get("coach_notes", [])
+    existing_block = "\n".join(f"{i}: {n['note']}" for i, n in enumerate(existing)) or "(none yet)"
     body = {
         "model": "claude-sonnet-5",
-        "max_tokens": 200,
+        "max_tokens": 250,
         "thinking": {"type": "disabled"},
         "system": (
-            "You extract long-term coaching memory for Roee Shor from one automated message. "
-            "Given the message just sent and the data behind it, decide if there is ONE short, "
-            "durable, non-obvious pattern worth remembering weeks from now - a recurring tendency, "
-            "how he responds to a type of session, a real recurring constraint. Not a one-off stat "
-            "from this week, and not anything generically true of any athlete. If nothing qualifies, "
-            "output exactly: NONE. Otherwise output ONE plain sentence, no preamble, no quotes."
+            "You maintain long-term coaching memory for Roee Shor from one automated message at a time. "
+            "Given the message just sent, the data behind it, and the EXISTING notes already remembered, decide "
+            "if there is a genuinely durable, non-obvious pattern worth remembering weeks from now - a recurring "
+            "tendency, how he responds to a type of session, a real recurring constraint. Not a one-off stat from "
+            "this week, and not anything generically true of any athlete.\n\n"
+            "If nothing qualifies: output exactly NONE.\n"
+            "If this is a NEW pattern unrelated to any existing note: output NEW: <one plain sentence>.\n"
+            "If this reinforces, sharpens, or extends a pattern an EXISTING note already covers (even worded "
+            "differently, e.g. a new instance of a recurring rest-day-avoidance note): output "
+            "UPDATE:<index>: <the existing note rewritten to fold in what's new - stay ONE sentence, keep it the "
+            "single sharpest version of that pattern, not an ever-growing concatenation>.\n"
+            "Never emit a note that just restates an existing one with different words and no new information - "
+            "that case is NONE, not a new note."
         ),
         "messages": [{
             "role": "user",
-            "content": f"CONTEXT: {context_label}\n\nMESSAGE SENT:\n{message_text}\n\nDATA (JSON):\n"
+            "content": f"EXISTING NOTES (index: note):\n{existing_block}\n\nCONTEXT: {context_label}\n\n"
+                       f"MESSAGE SENT:\n{message_text}\n\nDATA (JSON):\n"
                        f"{json.dumps(data, ensure_ascii=False, default=str)}",
         }],
     }
@@ -196,9 +215,25 @@ def maybe_extract_durable_note(state, context_label, data, message_text):
         return
     if not text or text.strip().upper() == "NONE":
         return
+
+    today = datetime.now(TZ).date().isoformat()
+    if text.startswith("UPDATE:"):
+        rest = text[len("UPDATE:"):].strip()
+        idx_str, _, note = rest.partition(":")
+        try:
+            idx = int(idx_str.strip())
+            existing[idx] = {"date": today, "note": note.strip()}
+            state["coach_notes"] = existing
+            return
+        except (ValueError, IndexError):
+            traceback.print_exc()
+            text = note.strip() or text  # fall through and add as new rather than lose it
+    elif text.startswith("NEW:"):
+        text = text[len("NEW:"):].strip()
+
     state.setdefault("coach_notes", [])
-    state["coach_notes"].append({"date": datetime.now(TZ).date().isoformat(), "note": text})
-    state["coach_notes"] = state["coach_notes"][-20:]
+    state["coach_notes"].append({"date": today, "note": text})
+    state["coach_notes"] = state["coach_notes"][-15:]
 
 
 # ---------------------------------------------------------------------------
