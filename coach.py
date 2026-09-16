@@ -61,7 +61,11 @@ If the DATA JSON includes recent_conversation, that's the actual recent chat his
 
 If the DATA JSON includes other_activities_today, Roee trained more than once today - factor the EARLIER session(s) into your read of this one (e.g. a hard interval session this morning changes what an elevated-HR easy walk tonight means; two sessions same day compounds fatigue differently than one) rather than analyzing this activity in isolation.
 
-Readiness, fitness (CTL), fatigue (ATL), form (TSB), and ACWR are ALL computed directly by this script from raw Garmin/Strava data (see the "note" field on each - readiness_context, pmc, acwr_context) - they are NOT Garmin's own proprietary metrics, and NOT from any third-party analytics service. Present them as exactly that: "your computed readiness is 78" not "Garmin says your readiness is 78". Garmin's role is limited to raw inputs (HRV, resting HR, sleep, VO2max) and its own genuinely-native numbers (VO2max, fitness age, race predictions) - never blur that line. readiness_context includes a `data_quality` field (how many days of baseline history exist) - if it's low (early days of this system, or after a data gap), say the number is provisional rather than presenting it with false confidence.
+Readiness, fitness (CTL), fatigue (ATL), form (TSB), and ACWR are ALL computed directly by this script from raw Garmin/Strava data (see the "note" field on each - readiness_context, pmc, acwr_context) - they are NOT Garmin's own proprietary metrics, and NOT from any third-party analytics service. Present them as exactly that: "your computed readiness is 78" not "Garmin says your readiness is 78". Garmin's role is limited to raw inputs (HRV, resting HR, sleep, VO2max) and its own genuinely-native numbers (VO2max, fitness age, race predictions, garmin_training_status) - never blur that line. readiness_context includes a `data_quality` field (how many days of baseline history exist) - if it's low (early days of this system, or after a data gap), say the number is provisional rather than presenting it with false confidence.
+
+If the DATA JSON includes garmin_training_status, that IS a genuinely Garmin-native signal (Garmin's own algorithm, e.g. Productive/Overreaching/Peaking/Maintaining/Detraining/Recovery/Unproductive) - a real second opinion, independent of this script's own TSB. When both are present, briefly reconcile them: if they point the same direction that's a useful confirmation worth one line; if they disagree, say so plainly rather than picking one silently - a disagreement is itself informative, not something to paper over.
+
+If the DATA JSON includes illness_risk_signals as a non-empty list, add a short <b>ILLNESS WATCH</b> section (place it right after RECOVERY CONTEXT) naming the specific elevated signal(s) verbatim from the list and recommending he pay attention to how he feels today, not push through if something feels off - this is a rough heuristic from raw physiological deviations (elevated resting HR vs baseline, and where available skin temperature/respiration), NOT a diagnosis, so frame it as "worth noticing" rather than alarming. If illness_risk_signals is present but empty, say nothing about illness at all - an empty list is a clean bill, not something to mention.
 
 For a per-activity analysis message, use this structure (omit any optional section that doesn't apply, given the data):
 [optional WARNING BENCHMARK ALERT line if a same-segment comparison shows both slower time AND higher HR than the prior instance]
@@ -675,6 +679,72 @@ def update_and_get_readiness(state, now):
     }
 
 
+def garmin_training_status(iso_date):
+    """Garmin's own Training Status verdict (Productive/Peaking/Overreaching/etc) -
+    a genuinely Garmin-native signal, independent of this script's self-computed TSB.
+    Field names are best-effort (garminconnect doesn't document this endpoint's shape
+    precisely) - degrades to None if the structure doesn't match."""
+    raw = garmin_safe("get_training_status", iso_date)
+    if not raw:
+        return None
+    try:
+        latest = raw["mostRecentTrainingStatus"]["latestTrainingStatusData"]
+        device_entry = next(iter(latest.values()))
+        phrase = device_entry.get("trainingStatusFeedbackPhrase") or device_entry.get("trainingStatus")
+        if phrase is None:
+            return None
+        label = str(phrase).replace("_", " ").split(" ")[0].title()
+        return {
+            "status": label,
+            "raw_phrase": phrase,
+            "note": ("Garmin's own native Training Status algorithm (not computed by this script) - "
+                     "a second opinion against the self-computed TSB/OVERTRAINING CHECK above."),
+        }
+    except (TypeError, KeyError, StopIteration, AttributeError):
+        return None
+
+
+def illness_risk_signals(state, now, iso_date):
+    """Best-effort illness early-warning: resting-HR elevation is solid (reuses
+    data already fetched for readiness); skin temperature and respiration are
+    best-effort since their exact garminconnect field names are unverified -
+    they degrade to nothing if the structure doesn't match, same as every other
+    Garmin call in this file."""
+    signals = []
+    history = state.get("wellness_history", [])
+    rhr_hist = [h["rhr"] for h in history if h.get("rhr") is not None and h["date"] != iso_date]
+    today_entry = next((h for h in history if h["date"] == iso_date), None)
+    rhr_mean, rhr_sd = _mean_stdev(rhr_hist)
+    if today_entry and today_entry.get("rhr") is not None and rhr_sd:
+        z = (today_entry["rhr"] - rhr_mean) / rhr_sd
+        if z > 1.5:
+            signals.append(f"resting HR {today_entry['rhr']}bpm is {z:.1f} SD above your baseline ({rhr_mean:.1f}bpm)")
+
+    skin_temp = garmin_safe("get_skin_temp_data", iso_date)
+    try:
+        deviation = None
+        if isinstance(skin_temp, list) and skin_temp:
+            deviation = skin_temp[0].get("avgDeviationCelsius") or skin_temp[0].get("deviation")
+        elif isinstance(skin_temp, dict):
+            deviation = skin_temp.get("avgDeviationCelsius") or skin_temp.get("deviation")
+        if deviation is not None and deviation > 0.5:
+            signals.append(f"skin temperature is {deviation:.1f}°C above your baseline")
+    except (TypeError, KeyError, AttributeError):
+        pass
+
+    respiration = garmin_safe("get_respiration_data", iso_date)
+    try:
+        resp_avg = None
+        if isinstance(respiration, dict):
+            resp_avg = respiration.get("avgWakingRespirationValue") or respiration.get("avgSleepRespirationValue")
+        if resp_avg is not None and resp_avg > 18:
+            signals.append(f"waking respiration rate is elevated at {resp_avg:.1f} breaths/min")
+    except (TypeError, AttributeError):
+        pass
+
+    return signals
+
+
 # ---------------------------------------------------------------------------
 # Telegram
 # ---------------------------------------------------------------------------
@@ -879,6 +949,8 @@ def step1_morning_brief(state, now):
         "body_battery": body_battery,
         "recent_user_metrics": user_metrics,
         "garmin_race_predictions": live_garmin_race_predictions(),
+        "garmin_training_status": garmin_training_status(today),
+        "illness_risk_signals": illness_risk_signals(state, now, today),
         "similar_recent_sessions": similar_detail,
         "long_term_notes": long_term_notes(state),
         "recent_conversation": recent_conversation(state),
@@ -1009,6 +1081,8 @@ def step3_new_activity_push(state, now):
             },
             "recent_user_metrics": user_metrics,
             "garmin_race_predictions": live_garmin_race_predictions(),
+            "garmin_training_status": garmin_training_status(activity_date),
+            "illness_risk_signals": illness_risk_signals(state, now, activity_date),
             "other_activities_today": other_activities_today,
             "easy_run_hr_drift": hr_drift,
             "long_term_notes": long_term_notes(state),
@@ -1159,6 +1233,7 @@ def step4_weekly_summary(state, now):
         "readiness_context": readiness,
         "pmc": pmc,
         "garmin_race_predictions": race_predictions,
+        "garmin_training_status": garmin_training_status(today),
         "user_metrics_90d": user_metrics,
         "next_week_plan": next_week_workouts,
         "shoes": gear_all,
