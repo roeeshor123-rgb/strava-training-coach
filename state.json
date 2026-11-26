@@ -2,7 +2,7 @@
   "last_activity_id": "20373017612",
   "last_telegram_update_id": 3338369,
   "last_weekly_summary_date": "2026-09-27",
-  "last_morning_checkin_date": "2026-10-08",
+  "last_morning_checkin_date": "2026-11-26",
   "shoe_alerts_sent": [],
   "coach_notes": [
     {
@@ -179,8 +179,8 @@
     }
   ],
   "pmc": {
-    "date": "2026-11-25",
-    "ctl": 17.8,
+    "date": "2026-11-26",
+    "ctl": 17.4,
     "atl": 0.3
   },
   "wellness_history": [
@@ -538,6 +538,11 @@
       "date": "2026-11-25",
       "hrv": null,
       "rhr": 54.0
+    },
+    {
+      "date": "2026-11-26",
+      "hrv": null,
+      "rhr": 47.0
     }
   ]
 }
